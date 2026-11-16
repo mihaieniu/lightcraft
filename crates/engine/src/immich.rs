@@ -258,3 +258,106 @@ impl<'a> Client<'a> {
         self.call("POST", &format!("/api/libraries/{library_id}/scan"), None).map(|_| ())
     }
 }
+
+/// What [`crate::LibrarySource::Immich`] shows: an album's photos (Local or in the library), found
+/// under `root`, the deepest folder holding them all (browsed photos only show in a folder view).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlbumView {
+    pub id: String,
+    pub name: String,
+    pub root: String,
+    pub photos: Vec<lightcraft_catalog::PhotoId>,
+}
+
+/// An album's photos here, and what was left out of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlbumFiles {
+    /// Files on disk LightCraft can open, as local paths.
+    pub files: Vec<String>,
+    /// Photos in no mapped folder.
+    pub unmapped: usize,
+    /// Photos in a mapped folder but not on disk (the mount is offline, or the file is gone).
+    pub missing: usize,
+    /// Files LightCraft doesn't open.
+    pub skipped: usize,
+}
+
+/// Most pages read for one album (1,000 photos each).
+const MAX_PAGES: u32 = 1000;
+
+/// Every photo of album `id`, mapped to this computer (all pages; network and disk, so a worker thread's job).
+pub fn album_files(cfg: &Config, id: &str, cancel: &AtomicBool) -> Result<AlbumFiles, String> {
+    let client = Client::new(cfg, cancel);
+    let mut out = AlbumFiles::default();
+    let mut page = 1;
+    for _ in 0..MAX_PAGES {
+        let (paths, next) = client.album_page(id, page)?;
+        for p in paths {
+            match cfg.to_local(&p) {
+                None => out.unmapped += 1,
+                Some(l) if !Path::new(&l).is_file() => out.missing += 1,
+                Some(l) if !crate::import::is_supported(Path::new(&l)) => out.skipped += 1,
+                Some(l) => out.files.push(l),
+            }
+        }
+        match next {
+            Some(n) if n > page => page = n,
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The deepest folder holding every one of `files` (by whole names); empty for none.
+pub fn common_root(files: &[String]) -> String {
+    let mut iter = files.iter().map(|f| Path::new(f).parent().map(Path::to_path_buf).unwrap_or_default());
+    let Some(mut root) = iter.next() else { return String::new() };
+    for dir in iter {
+        while !dir.starts_with(&root) {
+            if !root.pop() {
+                return String::new();
+            }
+        }
+    }
+    root.to_string_lossy().to_string()
+}
+
+impl crate::Session {
+    /// Switch the view to Immich album `id` (empty until [`crate::Session::add_to_immich_view`] adds its photos),
+    /// its photos under `root`.
+    pub fn show_immich_album(&mut self, id: &str, name: &str, root: String) {
+        self.immich_view = Some(AlbumView { id: id.to_string(), name: name.to_string(), root, photos: Vec::new() });
+        self.source = crate::LibrarySource::Immich;
+        self.refresh_view();
+        self.keep_active_in_view();
+    }
+
+    /// Add the photos of `files` (already in the catalog: browsed or imported) to the Immich album view.
+    pub fn add_to_immich_view(&mut self, files: &[String]) {
+        let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        let found: Vec<lightcraft_catalog::PhotoId> = self
+            .catalog
+            .photos()
+            .filter(|p| !p.deleted && matches!(&p.source, lightcraft_catalog::Source::File { path } if wanted.contains(path.as_str())))
+            .map(|p| p.id)
+            .collect();
+        if let Some(v) = &mut self.immich_view {
+            let mut have: std::collections::HashSet<lightcraft_catalog::PhotoId> = v.photos.iter().copied().collect();
+            v.photos.extend(found.into_iter().filter(|id| have.insert(*id)));
+        }
+        self.refresh_view();
+        self.keep_active_in_view();
+    }
+
+    /// Narrow `f` to the Immich album view (nothing without one).
+    pub(crate) fn immich_filter(&self, f: &mut lightcraft_catalog::Filter) {
+        match &self.immich_view {
+            Some(v) if !v.photos.is_empty() && !v.root.is_empty() => {
+                f.folder = Some(v.root.clone());
+                f.subfolders = true;
+                f.only = v.photos.clone();
+            }
+            _ => f.only_none = true,
+        }
+    }
+}

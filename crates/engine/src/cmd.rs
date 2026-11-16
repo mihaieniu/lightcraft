@@ -22,6 +22,8 @@ mod face_recognize;
 pub mod filters;
 mod focus;
 pub mod geocode;
+#[cfg(not(target_arch = "wasm32"))]
+mod immich;
 pub mod keywords;
 pub mod lens_refresh;
 pub mod library;
@@ -170,6 +172,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(print::specs());
         v.extend(before::specs());
         v.extend(browse::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(immich::specs());
         v.extend(missing::specs());
         v.extend(recheck::specs());
         v.extend(lens_refresh::specs());

@@ -312,6 +312,12 @@ pub struct Session {
     pub clipboard: Option<Value>,
     /// The folder on disk the [`LibrarySource::Folder`] view browses.
     pub browse: Option<Browse>,
+    /// Where Immich is ([`immich::Config::load`]); `None`: no Immich.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich: Option<immich::Config>,
+    /// The album the [`LibrarySource::Immich`] view shows.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich_view: Option<immich::AlbumView>,
     /// The folder the [`LibrarySource::LibraryFolder`] view shows: the library's photos imported
     /// from it and from the folders inside it.
     pub library_folder: Option<String>,
@@ -511,6 +517,10 @@ impl Session {
             clipboard: None,
             meta_clipboard: None,
             browse: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            immich: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            immich_view: None,
             library_folder: None,
             previous_active: None,
             copy_groups: lightcraft_develop::SettingsGroup::default_copy(),
@@ -1326,6 +1336,10 @@ impl Session {
             // no folder chosen: nothing (`.` names no folder)
             f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if source == LibrarySource::Immich {
+            self.immich_filter(&mut f);
+        }
         f
     }
 
@@ -1399,6 +1413,10 @@ impl Session {
             }
             if self.source == LibrarySource::LibraryFolder {
                 f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.source == LibrarySource::Immich {
+                self.immich_filter(&mut f);
             }
             // (how many, not which: nothing to put in order)
             let n = self.catalog.count(&f);

@@ -138,6 +138,12 @@ impl crate::Session {
         {
             self.apple_photos = Some(crate::apple_photos::osascript());
         }
+        // tests set their own (a developer's own config must not reach them)
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        match crate::immich::Config::load() {
+            Ok(c) => self.immich = c,
+            Err(e) => log::warn!("Immich: {e}"),
+        }
         self
     }
 }

@@ -50,7 +50,13 @@ pub(super) fn fake_immich(routes: Vec<(&'static str, u16, String)>) -> (String, 
             let mut parts = first.split_whitespace();
             let key = format!("{} {}", parts.next().unwrap_or_default(), parts.next().unwrap_or_default().split('?').next().unwrap_or_default());
             log.lock().unwrap().push((key.clone(), format!("{head}{}", String::from_utf8_lossy(&body))));
-            let (status, out) = routes.iter().find(|(k, _, _)| *k == key).map(|(_, st, b)| (*st, b.clone())).unwrap_or((404, "{}".into()));
+            let body_s = String::from_utf8_lossy(&body).to_string();
+            // a route `"POST /p|text"` also needs `text` in the request body
+            let hit = |k: &str| match k.split_once('|') {
+                Some((route, text)) => route == key && body_s.contains(text),
+                None => k == key,
+            };
+            let (status, out) = routes.iter().find(|(k, _, _)| hit(k)).map(|(_, st, b)| (*st, b.clone())).unwrap_or((404, "{}".into()));
             let resp = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{out}", out.len());
             let _ = (&s).write_all(resp.as_bytes());
         }
@@ -153,4 +159,113 @@ fn client_caps_body_size() {
     let cancel = AtomicBool::new(false);
     let e = Client::new(&c, &cancel).albums().unwrap_err();
     assert!(e.contains("too large"), "{e}");
+}
+
+fn png(p: &std::path::Path, seed: u8) {
+    let img = lightcraft_raster::Rgba8::from_fn(16, 12, |x, y| [(x * 9) as u8, (y * 11) as u8, seed, 255]);
+    let b =
+        crate::export::encode_image(&img, &crate::export::ExportOptions { format: crate::export::ExportFormat::Png, ..Default::default() }).unwrap();
+    std::fs::write(p, b).unwrap();
+}
+
+fn page(paths: &[&str], next: Option<&str>) -> String {
+    let items: Vec<_> = paths.iter().map(|p| json!({"originalPath": p, "type": "IMAGE"})).collect();
+    json!({"assets": {"items": items, "nextPage": next}}).to_string()
+}
+
+/// A folder `/srv/lib` (mapped to a temp dir holding a.png, b.png, sub/c.png, v.txt) and an album "a"
+/// listing a, sub/c, a path outside the map, a file not on disk and the text file.
+fn album_session(tag: &str) -> (crate::Session, PathBuf) {
+    let d = temp_dir(tag);
+    png(&d.join("a.png"), 1);
+    png(&d.join("b.png"), 2);
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    png(&d.join("sub/c.png"), 3);
+    std::fs::write(d.join("v.txt"), "x").unwrap();
+    let body = page(&["/srv/lib/a.png", "/srv/lib/sub/c.png", "/srv/other/x.jpg", "/srv/lib/gone.png", "/srv/lib/v.txt"], None);
+    let (url, _) = fake_immich(vec![("POST /api/search/metadata", 200, body)]);
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&url, &[("/srv/lib", d.to_str().unwrap())]));
+    (s, d)
+}
+
+fn visible_names(s: &mut crate::Session) -> Vec<String> {
+    let ids = s.visible().to_vec();
+    let mut v: Vec<String> = ids.iter().map(|id| s.catalog.photo(*id).unwrap().file_name.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn browse_album_shows_only_album_photos() {
+    let (mut s, _d) = album_session("only");
+    let r = s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(r["photos"], 2, "{r}");
+    assert_eq!(s.source, crate::LibrarySource::Immich);
+    assert_eq!(visible_names(&mut s), vec!["a.png", "c.png"]);
+    s.source = crate::LibrarySource::All;
+    assert!(visible_names(&mut s).is_empty(), "album photos stay out of All Photos (Local)");
+}
+
+#[test]
+fn browse_album_counts_unmapped_missing_and_skipped() {
+    let (mut s, _d) = album_session("counts");
+    let r = s.execute("immich.browseAlbum", &json!({"id": "a"})).unwrap();
+    assert_eq!((r["unmapped"].as_u64(), r["missing"].as_u64(), r["skipped"].as_u64()), (Some(1), Some(1), Some(1)), "{r}");
+}
+
+#[test]
+fn browse_album_pages_until_next_page_is_null() {
+    let d = temp_dir("pages");
+    png(&d.join("a.png"), 1);
+    png(&d.join("b.png"), 2);
+    let (url, seen) = fake_immich(vec![
+        (r#"POST /api/search/metadata|"page":1"#, 200, page(&["/srv/a.png"], Some("2"))),
+        (r#"POST /api/search/metadata|"page":2"#, 200, page(&["/srv/b.png"], None)),
+    ]);
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&url, &[("/srv", d.to_str().unwrap())]));
+    s.execute("immich.browseAlbum", &json!({"id": "a"})).unwrap();
+    assert_eq!(visible_names(&mut s), vec!["a.png", "b.png"]);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn an_empty_album_shows_nothing() {
+    let d = temp_dir("empty");
+    png(&d.join("a.png"), 1);
+    let (url, _) = fake_immich(vec![("POST /api/search/metadata", 200, page(&[], None))]);
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&url, &[("/srv", d.to_str().unwrap())]));
+    s.execute("library.browse", &json!({"path": d.to_string_lossy()})).unwrap();
+    s.execute("immich.browseAlbum", &json!({"id": "a"})).unwrap();
+    assert!(visible_names(&mut s).is_empty());
+}
+
+#[test]
+fn immich_commands_error_when_not_set_up() {
+    let mut s = crate::Session::new().with_fs();
+    s.immich = None;
+    for c in ["immich.albums", "immich.browseAlbum"] {
+        let e = s.execute(c, &json!({"id": "a"})).unwrap_err().to_string();
+        assert!(e.contains("Immich is not set up") && e.contains("immich.json"), "{c}: {e}");
+    }
+}
+
+#[test]
+fn immich_albums_lists_albums() {
+    let (url, _) = fake_immich(vec![("GET /api/albums", 200, json!([{"id": "a", "albumName": "Trip", "assetCount": 2}]).to_string())]);
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&url, &[]));
+    let r = s.execute("immich.albums", &json!({})).unwrap();
+    assert_eq!(r["albums"][0], json!({"id": "a", "name": "Trip", "count": 2}));
+}
+
+#[test]
+fn common_root_of_files() {
+    use crate::immich::common_root;
+    assert_eq!(common_root(&["/a/b/c.jpg".into(), "/a/d/e.jpg".into()]), "/a");
+    assert_eq!(common_root(&["/a/b/c.jpg".into()]), "/a/b");
+    assert_eq!(common_root(&["/a/bc/x.jpg".into(), "/a/b/y.jpg".into()]), "/a");
+    assert_eq!(common_root(&[]), "");
 }
