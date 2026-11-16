@@ -338,3 +338,13 @@ fn rescan_failure_does_not_fail_import() {
     assert_eq!(r["imported"].as_array().map(Vec::len), Some(1));
     s.immich_rescans.wait_idle();
 }
+
+#[test]
+fn a_windowless_exit_waits_for_the_rescan() {
+    let (mut s, d, seen) = rescan_session("exit");
+    s.immich_rescans = crate::immich::Rescans::with_delay(std::time::Duration::from_millis(300));
+    png(&d.join("late.png"), 7);
+    s.execute("library.import", &json!({"paths": [d.join("late.png").to_string_lossy()]})).unwrap();
+    s.wait_for_photos_imports();
+    assert_eq!(scans_seen(&seen), vec!["POST /api/libraries/L1/scan"], "the CLI / MCP exit path sent the rescan before returning");
+}

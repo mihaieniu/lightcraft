@@ -541,6 +541,8 @@ impl crate::Session {
     /// ([`Imports::wait_idle`], [`WaitLimits::default`]), so the process never abandons osascript
     /// or the import's result. True when it had to wait.
     pub fn wait_for_photos_imports(&self) -> bool {
+        // (fork) the same exits must not drop an Immich rescan an import or export asked for
+        self.immich_rescans.wait_idle();
         let Some(job) = self.apple_photos_imports.running() else { return false };
         log::warn!("Apple Photos: waiting for import {} to finish before exiting", job.id);
         if !self.apple_photos_imports.wait_idle() {
