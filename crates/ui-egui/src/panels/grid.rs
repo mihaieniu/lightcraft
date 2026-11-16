@@ -330,6 +330,13 @@ fn show_inner(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             );
         } else if app.session.source == lightcraft_engine::LibrarySource::Folder {
             super::empty_message(ui, ui.max_rect(), "No photos in this folder", "Turn on Include subfolders, or pick another folder under Local");
+        } else if app.session.source == lightcraft_engine::LibrarySource::Immich {
+            super::empty_message(
+                ui,
+                ui.max_rect(),
+                "None of this album's photos are here",
+                "Is the Immich storage mounted? Its folders are mapped in lightcraft/immich.json",
+            );
         } else if super::empty_library::shown(&app.session) {
             super::empty_library::show(app, ui, ui.max_rect());
         } else {

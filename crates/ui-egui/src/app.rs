@@ -112,6 +112,8 @@ impl LightcraftApp {
             merge: merge::MergeState::default(),
             import: None,
             scan: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            immich: Default::default(),
             scans_stopping: Default::default(),
             waiting_import: Default::default(),
             sync: None,

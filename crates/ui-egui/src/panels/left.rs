@@ -14,6 +14,8 @@ use crate::widgets::{icon_button, register};
 mod albums;
 mod dates;
 mod folders;
+#[cfg(not(target_arch = "wasm32"))]
+mod immich;
 mod keywords;
 mod local;
 mod rows;
@@ -176,6 +178,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 placed.push(at);
             }
             ui.data_mut(|d| d.remove::<String>(egui::Id::unique(SCROLL_TO_ROW)));
+            #[cfg(not(target_arch = "wasm32"))]
+            immich::section(app, ui);
             // room below the last section (a section dragged to the end is dropped here)
             ui.add_space(SECTION_GAP * 2.0);
             pinned_header(app, ui, &placed, view_top);

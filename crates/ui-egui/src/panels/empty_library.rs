@@ -14,11 +14,11 @@ pub fn is_empty(session: &lightcraft_engine::Session) -> bool {
     !session.catalog.photos().any(|p| p.in_library())
 }
 
-/// What is shown is the empty library: not a folder browsed under Local nor Recently Deleted,
+/// What is shown is the empty library: not a folder browsed under Local, an Immich album, nor Recently Deleted,
 /// whose photos aren't in the library but are on screen.
 pub fn shown(session: &lightcraft_engine::Session) -> bool {
     use lightcraft_engine::LibrarySource;
-    !matches!(session.source, LibrarySource::Folder | LibrarySource::RecentlyDeleted) && is_empty(session)
+    !matches!(session.source, LibrarySource::Folder | LibrarySource::RecentlyDeleted | LibrarySource::Immich) && is_empty(session)
 }
 
 /// At launch, an empty library opens on a grid with the sidebar, where the way in is (Detail had

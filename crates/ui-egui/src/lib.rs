@@ -30,6 +30,8 @@ mod frame_rate;
 pub mod headless;
 pub mod i18n;
 pub mod icons;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod immich_load;
 pub mod lens_db;
 pub mod lightroom_import;
 pub mod links;
@@ -328,6 +330,9 @@ pub struct LightcraftApp {
     pub import: Option<import::ImportTask>,
     /// A folder scan in progress (feeds the import review).
     pub scan: Option<import::ScanTask>,
+    /// Immich albums and the album loading ([`immich_load`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich: immich_load::State,
     /// Scans stopped without waiting for their workers: each channel is kept until its worker ends, so
     /// the probes it took from the session come back.
     pub(crate) scans_stopping: import::StoppingScans,

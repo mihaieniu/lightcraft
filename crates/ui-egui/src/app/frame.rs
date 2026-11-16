@@ -88,6 +88,8 @@ impl LightcraftApp {
         }
         panels::library_problem::import_waiting(self, ctx);
         lightroom_import::tick(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::immich_load::tick(self, ctx);
         recheck::tick(self);
         tasks::poll(self, ctx);
         // after the poll: a lookup that just finished is cleared, so photos queued meanwhile are looked up now
