@@ -78,6 +78,12 @@
 
 <br>
 
+## Fork additions
+
+This fork adds, on top of upstream LightCraft:
+
+- **[Immich](docs/immich.md)**: browse and edit the albums of a self-hosted Immich server from its mounted storage, and have Immich rescan after imports and exports.
+
 ## Edit like you mean it
 
 LightCraft is a complete darkroom in a single native app. Every adjustment is **non-destructive**, so your originals
