@@ -432,3 +432,36 @@ fn names_differing_only_in_case_are_one_file() {
     assert!(super::validate_files(&[spec("Model.bin")]).is_ok());
     assert!(super::validate_files(&[spec("Model.bin"), spec("model.BIN")]).is_err());
 }
+
+#[test]
+fn post_sends_method_length_and_body() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            head.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = [0u8; 7];
+        std::io::Read::read_exact(&mut r, &mut body).unwrap();
+        (&s).write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        (head, body.to_vec())
+    });
+    let url = http::Url::parse(&format!("http://127.0.0.1:{port}/api/x")).unwrap();
+    let cancel = AtomicBool::new(false);
+    let limits = http::Limits { connect: Duration::from_secs(5), stall: Duration::from_secs(5), cancel: &cancel };
+    let r = http::post(&url, &[("x-api-key", "k".into())], br#"{"a":1}"#, &limits).unwrap();
+    assert_eq!(r.status, 204);
+    let (head, body) = seen.join().unwrap();
+    assert!(head.starts_with("POST /api/x HTTP/1.1\r\n"), "{head}");
+    assert!(head.contains("Content-Length: 7\r\n"), "{head}");
+    assert!(head.contains("x-api-key: k\r\n"), "{head}");
+    assert_eq!(body, br#"{"a":1}"#);
+}
