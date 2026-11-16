@@ -45,6 +45,8 @@ pub mod files;
 mod focus_scan;
 pub mod fonts;
 pub mod guard;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod immich;
 pub mod import;
 mod import_move;
 pub mod lens_profiles;
