@@ -348,3 +348,46 @@ fn a_windowless_exit_waits_for_the_rescan() {
     s.wait_for_photos_imports();
     assert_eq!(scans_seen(&seen), vec!["POST /api/libraries/L1/scan"], "the CLI / MCP exit path sent the rescan before returning");
 }
+
+#[test]
+fn requests_arriving_steadily_make_one_scan_after_the_last() {
+    let (s, d, seen) = rescan_session("steady");
+    let rescans = crate::immich::Rescans::with_delay(std::time::Duration::from_millis(300));
+    let cfg = s.immich.clone().unwrap();
+    for i in 0..3 {
+        rescans.request(&cfg, vec![d.join(format!("{i}.png")).to_string_lossy().to_string()], &s.activity);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    rescans.wait_idle();
+    assert_eq!(scans_seen(&seen), vec!["POST /api/libraries/L1/scan"], "one import's batches make one scan");
+}
+
+#[test]
+fn a_failed_rescan_is_kept_for_the_front_end_to_show() {
+    let d = temp_dir("fail-shown");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let cfg = config(&format!("http://127.0.0.1:{port}"), &[("/srv/lib", d.to_str().unwrap())]);
+    let rescans = crate::immich::Rescans::with_delay(std::time::Duration::ZERO);
+    rescans.request(&cfg, vec![d.join("a.png").to_string_lossy().to_string()], &crate::activity::Activity::default());
+    rescans.wait_idle();
+    let e = rescans.take_error().expect("the failure is kept");
+    assert!(e.contains("unreachable"), "{e}");
+    assert!(rescans.take_error().is_none(), "shown once");
+}
+
+#[test]
+fn a_waiting_rescan_shows_in_the_activity_stack() {
+    let (s, d, _seen) = rescan_session("row");
+    let rescans = crate::immich::Rescans::with_delay(std::time::Duration::from_millis(300));
+    rescans.request(s.immich.as_ref().unwrap(), vec![d.join("a.png").to_string_lossy().to_string()], &s.activity);
+    assert!(s.activity.list().iter().any(|t| t.kind == "immich"), "{:?}", s.activity.list());
+    rescans.wait_idle();
+    assert!(!s.activity.list().iter().any(|t| t.kind == "immich"), "the row goes when the rescan is done");
+}
+
+#[test]
+fn browsing_an_album_records_its_folders_as_browsed() {
+    let (mut s, d) = album_session("stamp");
+    s.execute("immich.browseAlbum", &json!({"id": "a"})).unwrap();
+    assert!(s.catalog.last_browsed(d.to_str().unwrap()).is_some(), "untouched album photos aren't forgotten while the album is in use");
+}

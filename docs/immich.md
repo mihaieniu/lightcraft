@@ -26,7 +26,10 @@ edits them in place, the way it works on a Local folder.
    ```
 
 2. Create an API key in Immich (Account Settings → API Keys) and save it in a file only you can
-   read, e.g. `~/.config/immich/api-key` (mode 600). Or set `IMMICH_API_KEY`.
+   read, e.g. `~/.config/immich/api-key` (mode 600). Or set `IMMICH_API_KEY`. Listing albums and
+   their photos needs the album and asset read permissions; the rescan after an import needs the
+   library permissions, which only an admin's key has. With a narrower key, rescans fail with a
+   message and Immich picks the files up at its next scheduled scan.
 
 3. Write `~/.config/lightcraft/immich.json` (or under `$XDG_CONFIG_HOME`):
 

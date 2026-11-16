@@ -362,17 +362,29 @@ impl crate::Session {
     }
 }
 
-/// Asks Immich to rescan the libraries that hold newly written files, a moment after the last
-/// request so the batches of one import make one scan per library. Off the caller's thread; a
-/// failure is logged and shown on the activity row, never returned. Cheap to clone.
+/// Asks Immich to rescan the libraries that hold newly written files, once no request has come for
+/// `delay`, so the batches of one import (however long it runs) make one scan per library. Off the
+/// caller's thread; a failure is logged, shown on the activity row and kept for
+/// [`Rescans::take_error`], never returned. Cheap to clone.
 #[derive(Clone)]
 pub struct Rescans {
     inner: std::sync::Arc<RescanState>,
 }
 
+#[derive(Default)]
+struct Queue {
+    /// Paths as Immich sees them, waiting for a scan.
+    paths: Vec<String>,
+    /// A worker is waiting or scanning.
+    running: bool,
+    /// When the latest request came.
+    last: Option<std::time::Instant>,
+    /// The latest failure, until a front end takes it.
+    error: Option<String>,
+}
+
 struct RescanState {
-    /// (paths as Immich sees them waiting for a scan, a worker is running)
-    queue: std::sync::Mutex<(Vec<String>, bool)>,
+    queue: std::sync::Mutex<Queue>,
     idle: std::sync::Condvar,
     delay: Duration,
 }
@@ -384,9 +396,13 @@ impl Default for Rescans {
 }
 
 impl Rescans {
-    /// Wait `delay` after a request before scanning (gathering what else arrives meanwhile).
+    /// Scan once no request has come for `delay` (gathering an import's batches).
     pub fn with_delay(delay: Duration) -> Self {
         Rescans { inner: std::sync::Arc::new(RescanState { queue: Default::default(), idle: std::sync::Condvar::new(), delay }) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.inner.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Rescan, soon, the libraries of `cfg` holding any of `paths` (local paths); paths in no mapped folder are left out.
@@ -395,50 +411,61 @@ impl Rescans {
         if server.is_empty() {
             return;
         }
-        let mut q = self.inner.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        q.0.extend(server);
-        if q.1 {
+        let mut q = self.lock();
+        q.paths.extend(server);
+        q.last = Some(std::time::Instant::now());
+        if q.running {
             return;
         }
-        q.1 = true;
+        q.running = true;
         drop(q);
-        let (me, cfg, activity) = (self.clone(), cfg.clone(), activity.clone());
-        if let Err(e) = std::thread::Builder::new().name("immich-rescan".into()).spawn(move || me.work(&cfg, &activity)) {
+        // the row shows from the request on, not from when the worker gets going
+        let guard = activity.start("immich", "Telling Immich about new files", crate::activity::Cancel::No);
+        let (me, cfg) = (self.clone(), cfg.clone());
+        if let Err(e) = std::thread::Builder::new().name("immich-rescan".into()).spawn(move || me.work(&cfg, guard)) {
             log::warn!("Immich: could not start the rescan: {e}");
-            self.finish();
+            let mut q = self.lock();
+            q.running = false;
+            q.error = Some(format!("could not start the rescan: {e}"));
+            self.inner.idle.notify_all();
         }
     }
 
-    fn finish(&self) {
-        let mut q = self.inner.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        q.1 = false;
-        self.inner.idle.notify_all();
-    }
-
-    fn work(&self, cfg: &Config, activity: &crate::activity::Activity) {
-        let guard = activity.start("immich", "Telling Immich about new files", crate::activity::Cancel::No);
+    fn work(&self, cfg: &Config, guard: crate::activity::TaskGuard) {
         loop {
             std::thread::sleep(self.inner.delay);
             let paths = {
-                let mut q = self.inner.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if q.0.is_empty() {
-                    q.1 = false;
+                let mut q = self.lock();
+                // requests keep coming (an import's batches): wait for the last one
+                if q.last.is_some_and(|t| t.elapsed() < self.inner.delay) {
+                    continue;
+                }
+                if q.paths.is_empty() {
+                    // the row goes before anyone waiting hears the rescan is done
+                    drop(guard);
+                    q.running = false;
                     self.inner.idle.notify_all();
                     return;
                 }
-                std::mem::take(&mut q.0)
+                std::mem::take(&mut q.paths)
             };
             if let Err(e) = scan_holding(cfg, &paths) {
                 log::warn!("Immich: {e}");
                 guard.detail(&e);
+                self.lock().error = Some(e);
             }
         }
     }
 
+    /// The latest rescan failure, once (for a front end to show).
+    pub fn take_error(&self) -> Option<String> {
+        self.lock().error.take()
+    }
+
     /// Block until no rescan is waiting or running (tests; a one-shot CLI before it exits).
     pub fn wait_idle(&self) {
-        let mut q = self.inner.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        while q.1 {
+        let mut q = self.lock();
+        while q.running {
             q = self.inner.idle.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }

@@ -116,6 +116,10 @@ pub fn stop(app: &mut LightcraftApp) {
 
 /// Per frame: take the album list and the album's batches the workers sent.
 pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
+    // an import or export asked Immich to rescan, and that failed: the photos won't show up there
+    if let Some(e) = app.session.immich_rescans.take_error() {
+        app.toast_error(ctx, format!("Immich could not rescan: {e}"));
+    }
     if let Some(rx) = &app.immich.albums_rx {
         match rx.try_recv() {
             Ok(r) => {
@@ -153,6 +157,9 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 return;
             }
             Ok(Msg::Done) | Err(TryRecvError::Disconnected) => {
+                // the album's folders count as browsed: their untouched photos aren't forgotten while it is in use
+                let root = app.session.immich_view.as_ref().map(|v| v.root.clone()).unwrap_or_default();
+                app.session.note_browsed(&root, &task.found.files);
                 let left_out = task.found.missing + task.found.unmapped;
                 if left_out > 0 {
                     app.toast(ctx, format!("{left_out} photos of {} aren't on the mounted storage", task.name));

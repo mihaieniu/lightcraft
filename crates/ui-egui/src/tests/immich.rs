@@ -36,7 +36,11 @@ fn fake_immich(routes: Vec<(&'static str, String)>) -> String {
             let _ = r.read_exact(&mut body);
             let mut p = first.split_whitespace();
             let key = format!("{} {}", p.next().unwrap_or_default(), p.next().unwrap_or_default());
-            let out = routes.iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone()).unwrap_or_else(|| "{}".into());
+            let route = routes.iter().find(|(k, _)| k.trim_end_matches("~slow") == key);
+            if route.is_some_and(|(k, _)| k.ends_with("~slow")) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let out = route.map(|(_, b)| b.clone()).unwrap_or_else(|| "{}".into());
             let _ = (&s).write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{out}", out.len()).as_bytes());
         }
     });
@@ -110,4 +114,75 @@ fn an_album_with_none_of_its_photos_here_says_so() {
     let text = h.painted_text();
     assert!(!text.iter().any(|t| t == "Your library is empty"), "{text:?}");
     assert!(text.iter().any(|t| t == "None of this album's photos are here"), "{text:?}");
+}
+
+fn temp(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lc-ui-immich-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn config_for(url: &str, dir: &std::path::Path) -> lightcraft_engine::immich::Config {
+    let text = json!({"url": url, "paths": {"/srv": dir.to_string_lossy()}}).to_string();
+    lightcraft_engine::immich::Config::from_json(&text, Some("k".into()), None).unwrap()
+}
+
+fn visible_names(h: &mut Headless) -> Vec<String> {
+    let ids = h.app.session.visible().to_vec();
+    ids.iter().map(|id| h.app.session.catalog.photo(*id).unwrap().file_name.clone()).collect()
+}
+
+#[test]
+fn loading_an_album_shows_in_the_activity_stack_and_marks_its_folder_browsed() {
+    let dir = temp("row");
+    png(&dir.join("a.png"), 1);
+    let page = json!({"assets": {"items": [{"originalPath": "/srv/a.png"}], "nextPage": null}}).to_string();
+    let url = fake_immich(vec![
+        ("GET /api/albums", json!([{"id": "al1", "albumName": "Trip", "assetCount": 1}]).to_string()),
+        ("POST /api/search/metadata~slow", page),
+    ]);
+    let mut h = app(Some(config_for(&url, &dir)));
+    assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t == "Trip")));
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "source:immich:al1"}), T)["ok"], true);
+    assert!(h.app.session.activity.list().iter().any(|t| t.kind == "immich"), "{:?}", h.app.session.activity.list());
+    assert!(h.step_until(T, |h| h.app.immich.task.is_none()));
+    assert!(!h.app.session.activity.list().iter().any(|t| t.kind == "immich"), "the row goes when the album is in");
+    assert!(h.app.session.catalog.last_browsed(dir.to_str().unwrap()).is_some(), "untouched album photos aren't forgotten while the album is in use");
+}
+
+#[test]
+fn choosing_another_album_mid_load_shows_only_that_one() {
+    let dir = temp("switch");
+    png(&dir.join("a.png"), 1);
+    png(&dir.join("b.png"), 2);
+    let url = fake_immich(vec![
+        (
+            "GET /api/albums",
+            json!([{"id": "A", "albumName": "First", "assetCount": 1}, {"id": "B", "albumName": "Second", "assetCount": 1}]).to_string(),
+        ),
+        // every search answers slowly with the same page: the album id is in the request body, which this fake ignores
+        ("POST /api/search/metadata~slow", json!({"assets": {"items": [{"originalPath": "/srv/a.png"}], "nextPage": null}}).to_string()),
+    ]);
+    let mut h = app(Some(config_for(&url, &dir)));
+    assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t == "Second")));
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "source:immich:A"}), T)["ok"], true);
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "source:immich:B"}), T)["ok"], true);
+    assert!(h.step_until(T, |h| h.app.immich.task.is_none()));
+    assert_eq!(h.app.session.immich_view.as_ref().map(|v| v.id.as_str()), Some("B"), "the view is the album chosen last");
+    assert_eq!(h.app.session.activity.list().iter().filter(|t| t.kind == "immich").count(), 0, "the first album's load was stopped");
+    assert_eq!(visible_names(&mut h), vec!["a.png"]);
+}
+
+#[test]
+fn a_failed_rescan_is_shown() {
+    let dir = temp("rescan-fail");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let cfg = config_for(&format!("http://127.0.0.1:{port}"), &dir);
+    let mut h = app(Some(cfg.clone()));
+    h.app.session.immich_rescans = lightcraft_engine::immich::Rescans::with_delay(Duration::ZERO);
+    let rescans = h.app.session.immich_rescans.clone();
+    rescans.request(&cfg, vec![dir.join("x.png").to_string_lossy().to_string()], &h.app.session.activity);
+    rescans.wait_idle();
+    assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t.contains("Immich could not rescan"))), "{:?}", h.painted_text());
 }
