@@ -269,3 +269,72 @@ fn common_root_of_files() {
     assert_eq!(common_root(&["/a/bc/x.jpg".into(), "/a/b/y.jpg".into()]), "/a");
     assert_eq!(common_root(&[]), "");
 }
+
+fn scans_seen(seen: &Arc<Mutex<Vec<(String, String)>>>) -> Vec<String> {
+    seen.lock().unwrap().iter().map(|(k, _)| k.clone()).filter(|k| k.ends_with("/scan")).collect()
+}
+
+/// A session whose Immich has libraries L1 (`/srv/lib`, mapped to a temp dir) and L2 (`/srv/other`).
+fn rescan_session(tag: &str) -> (crate::Session, PathBuf, Arc<Mutex<Vec<(String, String)>>>) {
+    let d = temp_dir(tag);
+    let (url, seen) = fake_immich(vec![
+        ("GET /api/libraries", 200, json!([{"id": "L1", "importPaths": ["/srv/lib"]}, {"id": "L2", "importPaths": ["/srv/other"]}]).to_string()),
+        ("POST /api/libraries/L1/scan", 204, String::new()),
+        ("POST /api/libraries/L2/scan", 204, String::new()),
+    ]);
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&url, &[("/srv/lib", d.to_str().unwrap())]));
+    s.immich_rescans = crate::immich::Rescans::with_delay(std::time::Duration::ZERO);
+    (s, d, seen)
+}
+
+#[test]
+fn import_into_mapped_folder_requests_scan_of_owning_library() {
+    let (mut s, d, seen) = rescan_session("import");
+    png(&d.join("new.png"), 4);
+    s.execute("library.import", &json!({"paths": [d.join("new.png").to_string_lossy()]})).unwrap();
+    s.immich_rescans.wait_idle();
+    assert_eq!(scans_seen(&seen), vec!["POST /api/libraries/L1/scan"]);
+}
+
+#[test]
+fn local_browse_sends_no_rescan() {
+    let (mut s, d, seen) = rescan_session("browse");
+    png(&d.join("a.png"), 1);
+    s.execute("library.browse", &json!({"path": d.to_string_lossy()})).unwrap();
+    s.immich_rescans.wait_idle();
+    assert!(seen.lock().unwrap().is_empty(), "browsing never talks to Immich");
+}
+
+#[test]
+fn import_outside_mapped_folders_sends_nothing() {
+    let (mut s, _d, seen) = rescan_session("outside");
+    let other = temp_dir("outside-other");
+    png(&other.join("x.png"), 5);
+    s.execute("library.import", &json!({"paths": [other.join("x.png").to_string_lossy()]})).unwrap();
+    s.immich_rescans.wait_idle();
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn export_into_mapped_folder_requests_scan() {
+    let (s, d, seen) = rescan_session("export");
+    let after = s.after_export(&crate::export::ExportOptions::default()).unwrap();
+    let out = d.join("Edits/x.jpg").to_string_lossy().to_string();
+    let _ = after.run(&[json!({"path": out})], false);
+    s.immich_rescans.wait_idle();
+    assert_eq!(scans_seen(&seen), vec!["POST /api/libraries/L1/scan"]);
+}
+
+#[test]
+fn rescan_failure_does_not_fail_import() {
+    let d = temp_dir("fail");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut s = crate::Session::new().with_fs();
+    s.immich = Some(config(&format!("http://127.0.0.1:{port}"), &[("/srv/lib", d.to_str().unwrap())]));
+    s.immich_rescans = crate::immich::Rescans::with_delay(std::time::Duration::ZERO);
+    png(&d.join("n.png"), 6);
+    let r = s.execute("library.import", &json!({"paths": [d.join("n.png").to_string_lossy()]})).unwrap();
+    assert_eq!(r["imported"].as_array().map(Vec::len), Some(1));
+    s.immich_rescans.wait_idle();
+}

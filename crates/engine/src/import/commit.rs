@@ -334,6 +334,20 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
     if !placed.is_empty() {
         finish_moves(s, placed, log0, &mut report);
     }
+    // files added to a folder an Immich library scans: tell Immich (Local browsing never does)
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(cfg) = s.immich.as_ref().filter(|_| !opts.local && !report.imported.is_empty()) {
+        let paths = report
+            .imported
+            .iter()
+            .filter_map(|id| s.catalog.photo(PhotoId(*id)))
+            .filter_map(|p| match &p.source {
+                lightcraft_catalog::Source::File { path } => Some(path.clone()),
+                lightcraft_catalog::Source::Demo { .. } => None,
+            })
+            .collect();
+        s.immich_rescans.request(cfg, paths, &s.activity);
+    }
     Ok(report)
 }
 

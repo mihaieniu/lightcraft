@@ -323,6 +323,9 @@ pub struct Destination {
 pub struct AfterExport {
     #[cfg(not(target_arch = "wasm32"))]
     apple_photos: Option<crate::apple_photos::Reservation>,
+    /// Rescan the Immich libraries the files land in ([`crate::immich::Rescans`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    immich: Option<(crate::immich::Config, crate::immich::Rescans, crate::activity::Activity)>,
 }
 
 impl AfterExport {
@@ -331,12 +334,22 @@ impl AfterExport {
     /// [`crate::Session::after_export`], which checks the platform first.)
     #[cfg(not(target_arch = "wasm32"))]
     pub fn apple_photos(runner: crate::apple_photos::Runner, album: &str, imports: &crate::apple_photos::Imports) -> Result<Self, String> {
-        Ok(Self { apple_photos: Some(imports.reserve(runner, album)?) })
+        Ok(Self { apple_photos: Some(imports.reserve(runner, album)?), immich: None })
+    }
+
+    /// Hand the written files' paths to Immich's rescans (no-op for files in no mapped folder).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tell_immich(&mut self, files: &[serde_json::Value]) {
+        if let Some((cfg, rescans, activity)) = self.immich.take() {
+            let paths = files.iter().filter_map(|f| f.get("path").and_then(serde_json::Value::as_str)).map(str::to_string).collect();
+            rescans.request(&cfg, paths, &activity);
+        }
     }
 
     /// Nothing to do.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn is_none(&self) -> bool {
+        // Apple Photos only: front ends read this as "Photos will be asked" (an Immich rescan is quick and silent)
         self.apple_photos.is_none()
     }
 
@@ -353,7 +366,9 @@ impl AfterExport {
     /// requested, album}` with `{imported, ids, warning?}`, `{error}`, or `{skipped}` when the
     /// export was cancelled or wrote nothing). Never fails the export: its files are written
     /// either way.
-    pub fn run(self, files: &[serde_json::Value], cancelled: bool) -> Option<serde_json::Value> {
+    pub fn run(mut self, files: &[serde_json::Value], cancelled: bool) -> Option<serde_json::Value> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tell_immich(files);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(r) = self.apple_photos {
             return Some(r.run(files, cancelled));
@@ -366,7 +381,9 @@ impl AfterExport {
     /// outcome is the running job (`{job, running: true, requested, album}`; its result comes
     /// from `export.photosImports`, and the desktop app announces it). For a caller on the UI
     /// thread, which must not wait minutes for Photos.
-    pub fn start(self, files: &[serde_json::Value]) -> Option<serde_json::Value> {
+    pub fn start(mut self, files: &[serde_json::Value]) -> Option<serde_json::Value> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tell_immich(files);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(r) = self.apple_photos {
             return Some(r.start(files));
@@ -392,7 +409,12 @@ impl crate::Session {
     /// when it asks for Apple Photos and this platform or session has no way to reach it, or
     /// another import is reserved or running. For Photos the import slot is reserved from now on.
     pub fn after_export(&self, o: &ExportOptions) -> Result<AfterExport, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let immich = self.immich.clone().map(|c| (c, self.immich_rescans.clone(), self.activity.clone()));
         if !o.add_to_photos {
+            #[cfg(not(target_arch = "wasm32"))]
+            return Ok(AfterExport { immich, ..Default::default() });
+            #[cfg(target_arch = "wasm32")]
             return Ok(AfterExport::default());
         }
         if let Some(why) = apple_photos_unsupported() {
@@ -403,6 +425,7 @@ impl crate::Session {
             let runner = self.apple_photos.clone().ok_or_else(|| crate::apple_photos::unavailable().to_string())?;
             let mut after = AfterExport::apple_photos(runner, &o.photos_album, &self.apple_photos_imports)?;
             after.apple_photos = after.apple_photos.map(|r| r.shown_in(self.activity.clone()));
+            after.immich = immich;
             Ok(after)
         }
         #[cfg(target_arch = "wasm32")]

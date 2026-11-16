@@ -318,6 +318,9 @@ pub struct Session {
     /// The album the [`LibrarySource::Immich`] view shows.
     #[cfg(not(target_arch = "wasm32"))]
     pub immich_view: Option<immich::AlbumView>,
+    /// Rescans of the Immich libraries imports and exports write into.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich_rescans: immich::Rescans,
     /// The folder the [`LibrarySource::LibraryFolder`] view shows: the library's photos imported
     /// from it and from the folders inside it.
     pub library_folder: Option<String>,
@@ -521,6 +524,8 @@ impl Session {
             immich: None,
             #[cfg(not(target_arch = "wasm32"))]
             immich_view: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            immich_rescans: Default::default(),
             library_folder: None,
             previous_active: None,
             copy_groups: lightcraft_develop::SettingsGroup::default_copy(),
