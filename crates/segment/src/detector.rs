@@ -365,11 +365,53 @@ pub fn pick_prominent(areas: &[usize], on_focus: Option<&[bool]>) -> Vec<usize> 
     }
 }
 
-/// The instances of several detector outputs (one per concept: "person", "animal") above
-/// `threshold` that [`pick_prominent`] keeps, each with its share of its concept's semantic mask,
-/// merged into one mask. `focus`: where the camera focused (normalized). `None` when nothing is kept.
-pub fn subject(outs: &[Output], threshold: f32, focus: Option<(f32, f32)>) -> Option<Prediction> {
+/// Share of the sharpest kept person's sharpness another candidate needs to stay in the subject
+/// ("in focus or partly in focus").
+// ponytail: a relative threshold on the 90th-percentile Laplacian; a depth model would separate
+// planes better if photos with busy, sharp backgrounds trip it.
+pub const PARTLY_SHARP: f32 = 0.35;
+
+/// How near (in mask cells, Chebyshev) a held object must come to a kept person or animal to join
+/// the subject (≈2 % of the photo).
+// ponytail: adjacency stands in for "held"; an overlapping object far behind at the same spot joins too
+pub const HELD_REACH: usize = 6;
+
+/// The 90th percentile of `sharpness` over the cells `mask` selects (0: unknown).
+fn sharpness_of(mask: &[f32], sharpness: &[f32]) -> f32 {
+    if sharpness.len() != mask.len() {
+        return 0.0;
+    }
+    let mut v: Vec<f32> = mask.iter().zip(sharpness).filter(|(l, _)| **l > 0.0).map(|(_, s)| *s).collect();
+    v.sort_by(f32::total_cmp);
+    v.get(v.len().saturating_sub(1) * 9 / 10).copied().unwrap_or(0.0)
+}
+
+/// The cells within `reach` of a selected one (`side × side`).
+fn dilate(sel: &[bool], side: usize, reach: usize) -> Vec<bool> {
+    let pass = |src: &[bool], horizontal: bool| -> Vec<bool> {
+        (0..side * side)
+            .map(|i| {
+                let (x, y) = (i % side, i / side);
+                let c = if horizontal { x } else { y };
+                (c.saturating_sub(reach)..=(c + reach).min(side - 1))
+                    .any(|k| src.get(if horizontal { y * side + k } else { k * side + x }).copied().unwrap_or(false))
+            })
+            .collect()
+    };
+    pass(&pass(sel, true), false)
+}
+
+/// The photo's subject, merged into one mask: the people and animals (`people`: one detector
+/// output per concept, "person", "animal") above `threshold` that [`pick_prominent`] keeps, less
+/// those much blurrier than the sharpest of them ([`PARTLY_SHARP`]), plus the objects they hold
+/// (`held`: one output per concept, "bouquet", …) that come within [`HELD_REACH`] of them and are
+/// as sharp. Each instance gets its share of its concept's semantic mask. `sharpness`: the
+/// photo's per-cell sharpness ([`crate::mask::sharpness_grid`]; empty: unknown, nobody is left
+/// out for blur). `focus`: where the camera focused (normalized). `None` when no person or
+/// animal is kept.
+pub fn subject(people: &[Output], held: &[Output], sharpness: &[f32], threshold: f32, focus: Option<(f32, f32)>) -> Option<Prediction> {
     let s = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let outs: Vec<&Output> = people.iter().chain(held).collect();
     // (mask, score, concept)
     let mut cands: Vec<(Vec<f32>, f32, usize)> = Vec::new();
     for (c, out) in outs.iter().enumerate() {
@@ -388,15 +430,39 @@ pub fn subject(outs: &[Output], threshold: f32, focus: Option<(f32, f32)>) -> Op
     if side == 0 || side * side != n || cands.iter().any(|c| c.0.len() != n) {
         return None;
     }
-    let areas: Vec<usize> = cands.iter().map(|c| c.0.iter().filter(|l| **l > 0.0).count()).collect();
+    let is_person: Vec<bool> = cands.iter().map(|c| c.2 < people.len()).collect();
+    // the people and animals: today's choice among them only
+    let person_ix: Vec<usize> = (0..cands.len()).filter(|k| is_person[*k]).collect();
+    let areas: Vec<usize> = person_ix.iter().map(|k| cands[*k].0.iter().filter(|l| **l > 0.0).count()).collect();
     let cell = focus.filter(|(x, y)| x.is_finite() && y.is_finite()).map(|(x, y)| {
         let at = |v: f32| ((v.clamp(0.0, 1.0) * side as f32) as usize).min(side - 1);
         at(y) * side + at(x)
     });
-    let hits: Option<Vec<bool>> = cell.map(|i| cands.iter().map(|c| c.0.get(i).is_some_and(|l| *l > 0.0)).collect());
-    let keep = pick_prominent(&areas, hits.as_deref());
+    let hits: Option<Vec<bool>> = cell.map(|i| person_ix.iter().map(|k| cands[*k].0.get(i).is_some_and(|l| *l > 0.0)).collect());
+    let mut keep: Vec<usize> = pick_prominent(&areas, hits.as_deref()).into_iter().filter_map(|j| person_ix.get(j).copied()).collect();
+    // out of focus: much blurrier than the sharpest of them
+    let sharp: Vec<f32> = cands.iter().map(|c| sharpness_of(&c.0, sharpness)).collect();
+    let sharpest = keep.iter().map(|k| sharp[*k]).fold(0f32, f32::max);
+    let known = sharpest > 0.0;
+    if known {
+        keep.retain(|k| sharp[*k] >= PARTLY_SHARP * sharpest);
+    }
     if keep.is_empty() {
         return None;
+    }
+    // what they hold: near them, and as sharp
+    let mut near: Vec<bool> = vec![false; n];
+    for k in &keep {
+        for (v, l) in near.iter_mut().zip(&cands[*k].0) {
+            *v |= *l > 0.0;
+        }
+    }
+    let near = dilate(&near, side, HELD_REACH);
+    for k in (0..cands.len()).filter(|k| !is_person[*k]) {
+        let touches = cands[k].0.iter().zip(&near).any(|(l, v)| *l > 0.0 && *v);
+        if touches && (!known || sharp[k] >= PARTLY_SHARP * sharpest) {
+            keep.push(k);
+        }
     }
     let best = keep.iter().filter_map(|k| cands.get(*k)).map(|c| c.1).fold(0f32, f32::max);
     let mut merged: Option<Vec<f32>> = None;
@@ -468,6 +534,80 @@ mod tests {
         let mut none = vec![vec![1.0, 2.0]];
         share(&mut none, &[]);
         assert_eq!(none[0], [1.0, 2.0]);
+    }
+
+    const G: usize = 16;
+
+    /// A G × G mask: sure inside the cells `x0..x1 × y0..y1`, sure outside elsewhere.
+    fn rect(x0: usize, y0: usize, x1: usize, y1: usize) -> Vec<f32> {
+        (0..G * G).map(|i| if (x0..x1).contains(&(i % G)) && (y0..y1).contains(&(i / G)) { 5.0 } else { -5.0 }).collect()
+    }
+
+    /// Detector output with these instances, each found surely; no semantic mask.
+    fn found(masks: Vec<Vec<f32>>) -> Output {
+        let n = masks.len();
+        Output {
+            masks: Tensor::from_vec(masks.concat(), (n, 1, G * G), &Device::Cpu).unwrap(),
+            logits: vec![4.0; n],
+            presence: 8.0,
+            boxes: vec![[0.0; 4]; n],
+            text: Tensor::zeros(1, candle_core::DType::F32, &Device::Cpu).unwrap(),
+            semantic: Vec::new(),
+        }
+    }
+
+    /// Sharpness `hi` inside the given rectangles, `lo` elsewhere.
+    fn sharp(rects: &[(usize, usize, usize, usize)], hi: f32, lo: f32) -> Vec<f32> {
+        (0..G * G).map(|i| if rects.iter().any(|r| (r.0..r.2).contains(&(i % G)) && (r.1..r.3).contains(&(i / G))) { hi } else { lo }).collect()
+    }
+
+    const A: (usize, usize, usize, usize) = (1, 1, 6, 14);
+    const B: (usize, usize, usize, usize) = (9, 1, 14, 14);
+    fn cell(x: usize, y: usize) -> usize {
+        y * G + x
+    }
+
+    /// Two people as large: the one out of focus is left out.
+    #[test]
+    fn blurred_person_is_left_out() {
+        let people = [found(vec![rect(A.0, A.1, A.2, A.3), rect(B.0, B.1, B.2, B.3)])];
+        let s = subject(&people, &[], &sharp(&[A], 1.0, 0.1), 0.5, None).unwrap();
+        assert!(s.logits[cell(3, 7)] > 0.0, "the sharp one");
+        assert!(s.logits[cell(11, 7)] <= 0.0, "the blurred one");
+    }
+
+    /// Everyone equally soft (a missed focus): all kept.
+    #[test]
+    fn all_soft_people_are_kept() {
+        let people = [found(vec![rect(A.0, A.1, A.2, A.3), rect(B.0, B.1, B.2, B.3)])];
+        let s = subject(&people, &[], &sharp(&[], 0.0, 0.1), 0.5, None).unwrap();
+        assert!(s.logits[cell(3, 7)] > 0.0 && s.logits[cell(11, 7)] > 0.0);
+    }
+
+    /// A sharp bouquet touching the subject joins it; one far away, or blurred, doesn't.
+    #[test]
+    fn held_object_next_to_the_subject_joins_it() {
+        let people = [found(vec![rect(A.0, A.1, A.2, A.3)])];
+        let near = (6, 8, 9, 11);
+        let far = (14, 0, 16, 2);
+        let held = [found(vec![rect(near.0, near.1, near.2, near.3), rect(far.0, far.1, far.2, far.3)])];
+        let s = subject(&people, &held, &sharp(&[A, near, far], 1.0, 0.05), 0.5, None).unwrap();
+        assert!(s.logits[cell(7, 9)] > 0.0, "the bouquet in their hands");
+        assert!(s.logits[cell(15, 1)] <= 0.0, "a bouquet across the photo");
+        let s = subject(&people, &held, &sharp(&[A, far], 1.0, 0.05), 0.5, None).unwrap();
+        assert!(s.logits[cell(7, 9)] <= 0.0, "a blurred bouquet in front");
+        assert!(s.logits[cell(3, 7)] > 0.0);
+    }
+
+    /// Without a sharpness grid: the prominent people, as before.
+    #[test]
+    fn no_sharpness_keeps_todays_choice() {
+        let people = [found(vec![rect(A.0, A.1, A.2, A.3), rect(B.0, B.1, B.2, B.3), rect(14, 14, 15, 15)])];
+        let s = subject(&people, &[], &[], 0.5, None).unwrap();
+        assert!(s.logits[cell(3, 7)] > 0.0 && s.logits[cell(11, 7)] > 0.0);
+        assert!(s.logits[cell(14, 14)] <= 0.0, "the small one behind");
+        // held objects alone are no subject
+        assert!(subject(&[], &[found(vec![rect(A.0, A.1, A.2, A.3)])], &[], 0.5, None).is_none());
     }
 
     /// Describe: the instances above the threshold, each with its share of the semantic mask, merged;

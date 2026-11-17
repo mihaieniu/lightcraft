@@ -85,6 +85,10 @@ const _: () = assert!(MASK_SIDE == tracker::LOW_RES && INPUT == vit::IMAGE);
 /// (an object, a landscape's feature) is selected at the focus point instead.
 pub const SUBJECT_CONCEPTS: &[&str] = &["person", "animal"];
 
+/// What the subject's people may hold, which joins the subject when it is next to them and in
+/// focus ([`detector::subject`]).
+pub const HELD_CONCEPTS: &[&str] = &["bouquet", "flowers", "bag", "hat", "toy"];
+
 /// The files of a model directory.
 pub const WEIGHTS_FILE: &str = "model.safetensors";
 
@@ -260,8 +264,9 @@ impl Sam3 {
     /// without it the most prominent, with whoever is about as large. `None` when the subject is
     /// neither (a focus on something else, or nobody in the photo): select what is at the point.
     pub fn segment_subject(&mut self, enc: &mut Encoded, focus: Option<(f32, f32)>, threshold: f32) -> Result<Option<Prediction>> {
-        let outs = SUBJECT_CONCEPTS.iter().map(|c| self.detect(enc, c)).collect::<Result<Vec<_>>>()?;
-        Ok(detector::subject(&outs, threshold, focus))
+        let people = SUBJECT_CONCEPTS.iter().map(|c| self.detect(enc, c)).collect::<Result<Vec<_>>>()?;
+        let held = HELD_CONCEPTS.iter().map(|c| self.detect(enc, c)).collect::<Result<Vec<_>>>()?;
+        Ok(detector::subject(&people, &held, &enc.sharpness, threshold, focus))
     }
 
     /// Raw detector outputs for `text` (tests and tools).
