@@ -241,7 +241,11 @@ impl Tracker {
         };
         let best_multi = || (1..MASK_TOKENS).max_by(|a, b| iou.get(*a).partial_cmp(&iou.get(*b)).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(1);
         if multimask {
-            return pick(best_multi());
+            // one click: the whole object, not its smallest plausible part
+            let areas = (0..MASK_TOKENS)
+                .map(|i| Ok(masks.i((0, i))?.gt(0.0)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as usize))
+                .collect::<Result<Vec<_>>>()?;
+            return pick(pick_whole(&iou, &areas));
         }
         // single-mask output unless it is unstable (area changes > 2 % when the threshold moves ±0.05)
         let single = masks.i((0, 0))?;
@@ -249,5 +253,32 @@ impl Tracker {
         let union = single.gt(-0.05)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
         let stability = if union > 0.0 { inter / union } else { 1.0 };
         if stability >= 0.98 { pick(0) } else { pick(best_multi()) }
+    }
+}
+
+/// How much lower a larger alternative's predicted IoU may be than the best one's for one click
+/// to take it.
+// ponytail: a fixed margin; a per-photo choice (or showing the three alternatives) if it picks
+// too much.
+pub const WHOLE_MARGIN: f32 = 0.1;
+
+/// Which of SAM's alternatives (1.. ; 0 is the single-mask output) one click selects: the largest
+/// whose predicted IoU is within [`WHOLE_MARGIN`] of the best — the whole person, not the face.
+pub fn pick_whole(ious: &[f32], areas: &[usize]) -> usize {
+    let n = ious.len().min(areas.len());
+    let best = (1..n).filter_map(|i| ious.get(i).copied()).filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+    (1..n).filter(|i| ious.get(*i).is_some_and(|v| *v >= best - WHOLE_MARGIN)).max_by_key(|i| areas.get(*i).copied().unwrap_or(0)).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_click_prefers_the_whole_object() {
+        assert_eq!(pick_whole(&[0.0, 0.92, 0.88, 0.95], &[0, 100, 900, 300]), 2);
+        assert_eq!(pick_whole(&[0.0, 0.95, 0.70, 0.90], &[0, 100, 900, 300]), 3);
+        assert_eq!(pick_whole(&[], &[]), 1);
+        assert_eq!(pick_whole(&[0.0, f32::NAN, 0.5], &[0, 9, 4]), 2);
     }
 }
