@@ -87,7 +87,8 @@ pub const SUBJECT_CONCEPTS: &[&str] = &["person", "animal"];
 
 /// What the subject's people may hold, which joins the subject when it is next to them and in
 /// focus ([`detector::subject`]).
-pub const HELD_CONCEPTS: &[&str] = &["bouquet", "flowers", "bag", "hat", "toy"];
+// ponytail: one concept: each costs a detector pass (~9 s on a laptop CPU); add more when a GPU runs it
+pub const HELD_CONCEPTS: &[&str] = &["bouquet"];
 
 /// The files of a model directory.
 pub const WEIGHTS_FILE: &str = "model.safetensors";
