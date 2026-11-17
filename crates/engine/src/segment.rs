@@ -316,6 +316,16 @@ impl Segmenter {
 
 /// Mix `v` into a 64-bit hash.
 #[cfg_attr(not(feature = "sam"), allow(dead_code))]
+/// The text of a Find Subject selection (a Describe component): what it looked for.
+pub fn subject_text() -> String {
+    #[cfg(feature = "sam")]
+    {
+        lightcraft_segment::SUBJECT_CONCEPTS.iter().chain(lightcraft_segment::HELD_CONCEPTS).copied().collect::<Vec<_>>().join(", ")
+    }
+    #[cfg(not(feature = "sam"))]
+    String::from("person, animal, bouquet")
+}
+
 fn mix(h: u64, v: u64) -> u64 {
     (h ^ v).wrapping_mul(0x0100_0000_01b3).rotate_left(29)
 }
@@ -619,7 +629,9 @@ impl Session {
             MaskShape::Object { hint, exclude, seg: Some(seg), .. } if !hint.is_empty() && hint.len() + exclude.len() <= MAX_CLICKS => {
                 (seg.clone(), Prompt::Clicks(clicks_of(hint, exclude)))
             }
-            MaskShape::Prompt { text, seg: Some(seg), .. } => (seg.clone(), Prompt::Text(text.clone())),
+            // (not a found subject: a zoomed text search would bring back the blurred people and
+            // far objects it left out)
+            MaskShape::Prompt { text, seg: Some(seg), .. } if *text != subject_text() => (seg.clone(), Prompt::Text(text.clone())),
             _ => return Ok(false),
         };
         let p = self.catalog.photo(id).ok_or("no such photo")?;
@@ -742,6 +754,10 @@ impl Session {
                 }
             }
             Tag::Subject { photo, mask, comp, point } => {
+                // the user clicked meanwhile: their clicks (on their way) decide the selection
+                if self.segmenter.pending.as_ref().is_some_and(|p| (p.photo, p.mask, p.comp) == (photo, mask, comp)) {
+                    return;
+                }
                 let found = match o.result {
                     Ok(found) => found,
                     Err(e) => return polled.messages.push(e),
@@ -779,8 +795,7 @@ impl Session {
                         return;
                     }
                 };
-                let text =
-                    lightcraft_segment::SUBJECT_CONCEPTS.iter().chain(lightcraft_segment::HELD_CONCEPTS).copied().collect::<Vec<_>>().join(", ");
+                let text = subject_text();
                 c.shape = MaskShape::Prompt { text, seg: Some(seg), detail: Vec::new(), edge };
                 match self.set_develop(photo, d, "Find Subject") {
                     Ok(()) => polled.changed = true,
@@ -867,6 +882,35 @@ mod tests {
         assert_eq!(shape(&s), before);
         // an error reaches the user
         assert_eq!(send(&mut s, Err("boom".into())).messages, vec!["boom".to_string()]);
+    }
+
+    /// A click made while Find Subject runs wins: the subject's result (found or not) leaves the
+    /// component to the clicks on their way.
+    #[cfg(feature = "sam")]
+    #[test]
+    fn a_click_while_finding_the_subject_wins() {
+        use lightcraft_develop::{Mask, MaskComponent, MaskOp};
+        let mut s = Session::with_demo();
+        s.segmenter.dir = Some(std::env::temp_dir().join(format!("lc-no-sam3-subject-click-{}", std::process::id())));
+        let id = s.active().unwrap();
+        let waiting = || MaskShape::Object { hint: vec![], exclude: vec![], seg: None, detail: vec![], edge: 0.0 };
+        let mut d = (*s.develop_of(id).unwrap()).clone();
+        d.masks.push(Mask {
+            id: 3,
+            components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape: waiting() }],
+            ..Default::default()
+        });
+        s.set_develop(id, d, "test").unwrap();
+        let point = Point::new(0.4, 0.5);
+        for result in [Ok(Some(seg_box(20, 5, 5, 15, 15))), Ok(None)] {
+            // the user's click is on its way to the worker (here none runs: an idle poll forgets it)
+            s.segmenter.pending = Some(PendingClicks { photo: id, mask: 3, comp: 0, hint: vec![Point::new(0.2, 0.2)], exclude: vec![] });
+            let tag = Tag::Subject { photo: id, mask: 3, comp: 0, point };
+            s.segmenter.results.0.send(worker::Outcome { tag, result, superseded: false, notice: None }).unwrap();
+            let polled = s.segment_poll();
+            assert!(!polled.changed && polled.messages.is_empty(), "{:?}", polled.messages);
+            assert_eq!(s.develop_of(id).unwrap().masks[0].components[0].shape, waiting(), "left for the click");
+        }
     }
 
     fn seg_box(side: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> SegMask {

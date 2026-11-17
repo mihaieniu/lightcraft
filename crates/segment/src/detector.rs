@@ -430,37 +430,55 @@ pub fn subject(people: &[Output], held: &[Output], sharpness: &[f32], threshold:
     if side == 0 || side * side != n || cands.iter().any(|c| c.0.len() != n) {
         return None;
     }
-    let is_person: Vec<bool> = cands.iter().map(|c| c.2 < people.len()).collect();
-    // the people and animals: today's choice among them only
-    let person_ix: Vec<usize> = (0..cands.len()).filter(|k| is_person[*k]).collect();
-    let areas: Vec<usize> = person_ix.iter().map(|k| cands[*k].0.iter().filter(|l| **l > 0.0).count()).collect();
+    let person = |k: usize| cands.get(k).is_some_and(|c| c.2 < people.len());
+    let mask_of = |k: usize| cands.get(k).map_or(&[][..], |c| c.0.as_slice());
+    let selects = |k: usize, i: usize| mask_of(k).get(i).is_some_and(|l| *l > 0.0);
+    let sharp: Vec<f32> = cands.iter().map(|c| sharpness_of(&c.0, sharpness)).collect();
+    let sharp_of = |k: usize| sharp.get(k).copied().unwrap_or(0.0);
+    // out of focus first, whatever their size: a big blurred person in front is no subject
+    let all_people: Vec<usize> = (0..cands.len()).filter(|k| person(*k)).collect();
+    let sharpest_person = all_people.iter().map(|k| sharp_of(*k)).fold(0f32, f32::max);
+    let known = sharpest_person > 0.0;
+    let person_ix: Vec<usize> = all_people.into_iter().filter(|k| !known || sharp_of(*k) >= PARTLY_SHARP * sharpest_person).collect();
+    // then the prominent ones among them
+    let areas: Vec<usize> = person_ix.iter().map(|k| mask_of(*k).iter().filter(|l| **l > 0.0).count()).collect();
     let cell = focus.filter(|(x, y)| x.is_finite() && y.is_finite()).map(|(x, y)| {
         let at = |v: f32| ((v.clamp(0.0, 1.0) * side as f32) as usize).min(side - 1);
         at(y) * side + at(x)
     });
-    let hits: Option<Vec<bool>> = cell.map(|i| person_ix.iter().map(|k| cands[*k].0.get(i).is_some_and(|l| *l > 0.0)).collect());
+    let hits: Option<Vec<bool>> = cell.map(|i| {
+        // a focus on something held is a focus on whoever holds it
+        let held_at: Vec<usize> = (0..cands.len()).filter(|k| !person(*k) && selects(*k, i)).collect();
+        person_ix
+            .iter()
+            .map(|p| {
+                selects(*p, i) || {
+                    let reach = if held_at.is_empty() {
+                        Vec::new()
+                    } else {
+                        dilate(&mask_of(*p).iter().map(|l| *l > 0.0).collect::<Vec<_>>(), side, HELD_REACH)
+                    };
+                    held_at.iter().any(|h| mask_of(*h).iter().zip(&reach).any(|(l, v)| *l > 0.0 && *v))
+                }
+            })
+            .collect()
+    });
     let mut keep: Vec<usize> = pick_prominent(&areas, hits.as_deref()).into_iter().filter_map(|j| person_ix.get(j).copied()).collect();
-    // out of focus: much blurrier than the sharpest of them
-    let sharp: Vec<f32> = cands.iter().map(|c| sharpness_of(&c.0, sharpness)).collect();
-    let sharpest = keep.iter().map(|k| sharp[*k]).fold(0f32, f32::max);
-    let known = sharpest > 0.0;
-    if known {
-        keep.retain(|k| sharp[*k] >= PARTLY_SHARP * sharpest);
-    }
     if keep.is_empty() {
         return None;
     }
-    // what they hold: near them, and as sharp
+    // what they hold: near them, and about as sharp as the sharpest of them
+    let sharpest = keep.iter().map(|k| sharp_of(*k)).fold(0f32, f32::max);
     let mut near: Vec<bool> = vec![false; n];
     for k in &keep {
-        for (v, l) in near.iter_mut().zip(&cands[*k].0) {
+        for (v, l) in near.iter_mut().zip(mask_of(*k)) {
             *v |= *l > 0.0;
         }
     }
     let near = dilate(&near, side, HELD_REACH);
-    for k in (0..cands.len()).filter(|k| !is_person[*k]) {
-        let touches = cands[k].0.iter().zip(&near).any(|(l, v)| *l > 0.0 && *v);
-        if touches && (!known || sharp[k] >= PARTLY_SHARP * sharpest) {
+    for k in (0..cands.len()).filter(|k| !person(*k)) {
+        let touches = mask_of(k).iter().zip(&near).any(|(l, v)| *l > 0.0 && *v);
+        if touches && (!known || sharp_of(k) >= PARTLY_SHARP * sharpest) {
             keep.push(k);
         }
     }
@@ -597,6 +615,30 @@ mod tests {
         let s = subject(&people, &held, &sharp(&[A, far], 1.0, 0.05), 0.5, None).unwrap();
         assert!(s.logits[cell(7, 9)] <= 0.0, "a blurred bouquet in front");
         assert!(s.logits[cell(3, 7)] > 0.0);
+    }
+
+    /// No focus recorded: a small sharp subject beats a big blurred person in front.
+    #[test]
+    fn sharp_small_subject_beats_big_blurred_foreground() {
+        let big = (0, 0, 10, 16);
+        let small = (12, 4, 15, 8);
+        let people = [found(vec![rect(big.0, big.1, big.2, big.3), rect(small.0, small.1, small.2, small.3)])];
+        let s = subject(&people, &[], &sharp(&[small], 1.0, 0.05), 0.5, None).unwrap();
+        assert!(s.logits[cell(13, 5)] > 0.0, "the sharp one");
+        assert!(s.logits[cell(4, 8)] <= 0.0, "the blurred one in front");
+    }
+
+    /// The camera focused on the bouquet in someone's hands: that person (and the bouquet) is the
+    /// subject, not the bouquet alone.
+    #[test]
+    fn focus_on_the_bouquet_selects_who_holds_it() {
+        let people = [found(vec![rect(A.0, A.1, A.2, A.3), rect(B.0, B.1, B.2, B.3)])];
+        let near = (6, 8, 9, 11);
+        let held = [found(vec![rect(near.0, near.1, near.2, near.3)])];
+        let focus = Some((7.5 / G as f32, 9.5 / G as f32));
+        let s = subject(&people, &held, &sharp(&[A, B, near], 1.0, 0.05), 0.5, focus).unwrap();
+        assert!(s.logits[cell(3, 7)] > 0.0 && s.logits[cell(7, 9)] > 0.0, "who holds it, and the bouquet");
+        assert!(s.logits[cell(11, 7)] > 0.0, "and whoever is as large beside them");
     }
 
     /// Without a sharpness grid: the prominent people, as before.

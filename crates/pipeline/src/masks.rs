@@ -164,7 +164,10 @@ pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, l
     let mut first = true;
     for comp in &m.components {
         let mut c = shape_alpha(&comp.shape, frame, w, h, img, log_l, ev, mattes);
-        if comp.invert {
+        // an AI selection not computed yet selects nothing either way: inverted, it would
+        // select the whole photo while it waits (or after it failed)
+        let waiting = matches!(comp.shape, MaskShape::Object { seg: None, .. } | MaskShape::Prompt { seg: None, .. });
+        if comp.invert && !waiting {
             c.data.iter_mut().for_each(|v| *v = 1.0 - *v);
         }
         if first {

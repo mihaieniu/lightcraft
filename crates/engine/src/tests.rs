@@ -489,6 +489,42 @@ fn find_subject_mask_is_an_inverted_waiting_object_for_background() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A found subject isn't refined by a zoomed text search: it would bring back the blurred people
+/// and far objects the subject left out.
+#[test]
+fn a_found_subject_gets_no_zoomed_text_pass() {
+    if !crate::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    let mut s = demo();
+    let id = s.active().unwrap();
+    let dir = segment::damaged_model("subject-detail");
+    s.segmenter.dir = Some(dir.clone());
+    let side = 20usize;
+    let logits: Vec<f32> =
+        (0..side * side).map(|i| if (5..10).contains(&(i % side)) && (5..10).contains(&(i / side)) { 8.0 } else { -8.0 }).collect();
+    let seg = lightcraft_develop::SegMask::from_logits(side, &logits);
+    let mut d = (*s.develop_of(id).unwrap()).clone();
+    let prompt = |text: String| lightcraft_develop::MaskShape::Prompt { text, seg: Some(seg.clone()), detail: vec![], edge: 0.0 };
+    for (mid, text) in [(1, crate::segment::subject_text()), (2, "the sky".to_string())] {
+        d.masks.push(lightcraft_develop::Mask {
+            id: mid,
+            components: vec![lightcraft_develop::MaskComponent {
+                name: None,
+                op: lightcraft_develop::MaskOp::Add,
+                invert: false,
+                shape: prompt(text),
+            }],
+            ..Default::default()
+        });
+    }
+    s.set_develop(id, d, "test").unwrap();
+    s.segmenter.background = true;
+    assert_eq!(s.segment_detail(id, 1, 0), Ok(false), "the subject");
+    assert_eq!(s.segment_detail(id, 2, 0), Ok(true), "an ordinary Describe selection still is");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Deleting the mask that is the Lens Blur focus clears the focus, so a new mask that gets the same
 /// id doesn't become the focus; undo brings both back.
 #[test]

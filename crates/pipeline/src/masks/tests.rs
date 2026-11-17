@@ -216,6 +216,17 @@ fn ai_shapes_without_a_segmentation_select_nothing() {
     }
 }
 
+/// An inverted AI component still waiting for its selection (Background while SAM 3 runs, or
+/// after it failed) selects nothing, not the whole photo.
+#[test]
+fn an_inverted_waiting_ai_component_selects_nothing() {
+    let f = frame(30, 30);
+    let (img, l) = (Rgb32f::new(30, 30), Plane::new(30, 30));
+    let waiting = MaskShape::Object { hint: vec![], exclude: vec![], seg: None, detail: vec![], edge: 0.0 };
+    let m = Mask { components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: true, shape: waiting }], ..Default::default() };
+    assert!(evaluate_one(&m, &f, 30, 30, &img, &l, 0.0, None).data.iter().all(|v| *v == 0.0));
+}
+
 #[test]
 fn radial_inside_and_invert() {
     let f = frame(100, 100);
