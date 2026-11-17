@@ -441,6 +441,54 @@ fn find_subject_without_the_model_changes_nothing() {
     assert_eq!(*before, *after);
 }
 
+/// `mask.findSubject` (Subject / Background) without the SAM 3 model is an error that leaves the
+/// photo as it was.
+#[test]
+fn find_subject_mask_without_the_model_changes_nothing() {
+    let mut s = demo();
+    let id = s.active().unwrap();
+    s.segmenter.dir = Some(std::env::temp_dir().join(format!("lc-no-sam3-fs-{}", std::process::id())));
+    let before = s.develop_of(id).unwrap();
+    for p in [json!({}), json!({"invert": true})] {
+        let e = s.execute("mask.findSubject", &p).unwrap_err();
+        assert!(e.to_string().contains("SAM 3") || e.to_string().contains("AI masks"), "{e}");
+    }
+    assert_eq!(*before, *s.develop_of(id).unwrap());
+}
+
+/// Background is an inverted Object waiting for the subject, named so; Subject the same, not
+/// inverted; added to the active mask with `op`.
+#[test]
+fn find_subject_mask_is_an_inverted_waiting_object_for_background() {
+    if !crate::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    let mut s = demo();
+    s.segmenter.background = true;
+    let id = s.active().unwrap();
+    let dir = segment::damaged_model("find-subject-mask");
+    s.segmenter.dir = Some(dir.clone());
+    let r = s.execute("mask.findSubject", &json!({"invert": true})).unwrap();
+    assert_eq!(r["pending"], true);
+    let d = s.develop_of(id).unwrap();
+    let m = &d.masks[0];
+    assert_eq!(m.name, "Background");
+    assert_eq!(r["mask"], json!(m.id));
+    assert!(m.components[0].invert);
+    assert!(matches!(&m.components[0].shape, lightcraft_develop::MaskShape::Object { hint, seg: None, .. } if hint.is_empty()));
+    s.execute("mask.findSubject", &json!({})).unwrap();
+    let d = s.develop_of(id).unwrap();
+    assert_eq!(d.masks[1].name, "Subject");
+    assert!(!d.masks[1].components[0].invert);
+    let r = s.execute("mask.findSubject", &json!({"op": "subtract"})).unwrap();
+    let d = s.develop_of(id).unwrap();
+    assert_eq!(d.masks.len(), 2);
+    assert_eq!(d.masks[1].components.len(), 2);
+    assert_eq!(d.masks[1].components[1].op, lightcraft_develop::MaskOp::Subtract);
+    assert_eq!(r["comp"], 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Deleting the mask that is the Lens Blur focus clears the focus, so a new mask that gets the same
 /// id doesn't become the focus; undo brings both back.
 #[test]

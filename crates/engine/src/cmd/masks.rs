@@ -142,6 +142,37 @@ fn queue_later(s: &mut Session, later: Later, mask: u32, comp: usize, mut out: V
     Ok(out)
 }
 
+/// `mask.findSubject`: an Object component waiting for the subject (inverted for Background),
+/// filled by the segmenter ([`Session::segment_subject_later`]).
+fn find_subject(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "mask.findSubject";
+    let id = s.active().ok_or_else(|| bad(C, "no active photo"))?;
+    // nothing is added without the model
+    s.segmenter.require_model()?;
+    let invert = bool_or(p, "invert", false);
+    let op = str_param(p, "op").unwrap_or("new");
+    let (point, from) = super::develop::subject_point(s, id, C)?;
+    let focus = (from == "camera").then_some(point);
+    let out = if op == "new" {
+        let name = str_param(p, "name").unwrap_or(if invert { "Background" } else { "Subject" });
+        s.execute("mask.add", &json!({"kind": "object", "name": name, "invert": invert}))?
+    } else {
+        s.execute("mask.addComponent", &json!({"op": op, "kind": "object", "invert": invert}))?
+    };
+    let mask = out
+        .get("activeMask")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| bad(C, "the subject mask was not created"))?;
+    let comp = s.develop_of(id).and_then(|d| d.masks.iter().find(|m| m.id == mask).map(|m| m.components.len().saturating_sub(1))).unwrap_or(0);
+    if let Err(e) = s.segment_subject_later(id, mask, comp, point, focus) {
+        // nothing half-made: the empty component goes again
+        let _ = s.execute("edit.undo", &json!({}));
+        return Err(ai_err(e));
+    }
+    Ok(json!({"mask": mask, "comp": comp, "pending": s.segmenter.background}))
+}
+
 /// AI mask failures are shown as they are (not as "invalid parameters").
 fn ai_err(msg: impl Into<String>) -> crate::EngineError {
     crate::EngineError::Other(msg.into())
@@ -275,7 +306,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     masks.push(Mask {
                         id: next,
                         name: name.unwrap_or_else(|| format!("Mask {next}")),
-                        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+                        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: bool_or(p, "invert", false), shape }],
                         adjust,
                         ..Default::default()
                     });
@@ -284,6 +315,15 @@ pub fn specs() -> Vec<CommandSpec> {
                 })?;
                 queue_later(s, later, next, 0, out)
             }
+        ),
+        cmd!(
+            "mask.findSubject",
+            "Find Subject Mask",
+            [],
+            None,
+            "{op?: new|add|subtract|intersect (new), invert?: bool, name?} — selects the photo's subject with SAM 3 (the people and animals in focus, with what they hold; else the object at the camera's focus point or the likeliest subject) as a new mask (\"Subject\", or inverted \"Background\") or a component of the active mask; in the app the selection appears when found → {mask, comp, pending}",
+            has_active,
+            find_subject
         ),
         cmd!(
             "mask.addComponent",
