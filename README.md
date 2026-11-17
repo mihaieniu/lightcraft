@@ -83,6 +83,7 @@
 This fork adds, on top of upstream LightCraft:
 
 - **[Immich](docs/immich.md)**: browse and edit the albums of a self-hosted Immich server from its mounted storage, and have Immich rescan after imports and exports.
+- **AI Subject and Background masks**: SAM 3 selects the people and animals in focus with what they hold (Background is its exact inverse), and a first Object click selects the whole object.
 
 ## Edit like you mean it
 

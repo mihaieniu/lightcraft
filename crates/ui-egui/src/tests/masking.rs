@@ -2309,3 +2309,34 @@ fn a_masks_lens_blur_block_picks_the_side_and_switches_off() {
     assert!(!h.app.ui.section_folded("maskLensBlur"));
     h.settle(SETTLE);
 }
+
+/// The Subject and Background tiles find the subject with SAM 3: an Object waiting for it (the
+/// Background one inverted), named so. A build without AI masks keeps the estimated shapes.
+#[test]
+fn subject_and_background_tiles_find_the_subject() {
+    use lightcraft_develop::MaskShape;
+    use lightcraft_engine::segment::Segmenter;
+    let mut h = detail("panel.masking");
+    // a model folder that looks installed (the worker fails later; nothing waits for it)
+    let dir = std::env::temp_dir().join(format!("lc-ui-subject-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.safetensors"), b"\x10\x00\x00\x00\x00\x00\x00\x00{not json at all}").unwrap();
+    std::fs::write(dir.join("vocab.json"), b"{}").unwrap();
+    std::fs::write(dir.join("merges.txt"), b"#version: 0.2\n").unwrap();
+    h.app.session.segmenter.dir = Some(dir.clone());
+    for (tile, name, invert) in [("maskNew:subject", "Subject", false), ("maskNew:background", "Background", true)] {
+        let r = h.request("ui.clickWidget", json!({"id": tile}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        let d = develop(&h);
+        let m = d.masks.last().expect("a mask");
+        let c = &m.components[0];
+        if Segmenter::AVAILABLE {
+            assert_eq!(m.name, name);
+            assert_eq!(c.invert, invert, "{tile}");
+            assert!(matches!(&c.shape, MaskShape::Object { hint, seg: None, .. } if hint.is_empty()), "{tile}: {:?}", c.shape);
+        } else {
+            assert!(matches!(c.shape, MaskShape::Subject | MaskShape::Background), "{tile}: {:?}", c.shape);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

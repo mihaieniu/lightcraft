@@ -139,6 +139,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                             app.toast(ui.ctx(), crate::i18n::tr("Click the photo to pick a colour · ⇧-click adds more"));
                         }
                         "object" => start_object(app, ui.ctx(), "new"),
+                        "subject" => start_subject(app, ui.ctx(), "new", false),
+                        "background" => start_subject(app, ui.ctx(), "new", true),
                         "prompt" => start_describe(app, "new"),
                         "brush" => {
                             let _ = app.run("tool.brush", json!({"new": true}));
@@ -788,7 +790,23 @@ pub(crate) fn start_object(app: &mut LightcraftApp, ctx: &egui::Context, op: &st
     }
 }
 
-/// Start an AI mask of `kind` (object|prompt) combined by `op` (new|add|subtract|intersect),
+/// Subject (or, `invert`, Background): the photo's subject found by SAM 3 as a new mask or a
+/// component combined by `op`. A build without AI masks keeps the shape estimated from the photo.
+pub(crate) fn start_subject(app: &mut LightcraftApp, ctx: &egui::Context, op: &str, invert: bool) {
+    let kind = if invert { "background" } else { "subject" };
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        let _ = if op == "new" { app.run("mask.add", json!({"kind": kind})) } else { app.run("mask.addComponent", json!({"op": op, "kind": kind})) };
+        return;
+    }
+    if needs_model(app, kind, op) {
+        return;
+    }
+    if let Err(e) = app.run_typed("mask.findSubject", json!({"op": op, "invert": invert})) {
+        app.ai_error(ctx, e, Some((kind, op)));
+    }
+}
+
+/// Start an AI mask of `kind` (object|prompt|subject|background) combined by `op` (new|add|subtract|intersect),
 /// after the model was installed.
 pub(crate) fn begin_ai(app: &mut LightcraftApp, kind: &str, op: &str) -> Result<serde_json::Value, String> {
     match kind {
@@ -801,6 +819,7 @@ pub(crate) fn begin_ai(app: &mut LightcraftApp, kind: &str, op: &str) -> Result<
             app.ui.tool = "object".into();
             Ok(r)
         }
+        "subject" | "background" => app.run("mask.findSubject", json!({"op": op, "invert": kind == "background"})),
         _ => {
             app.ui.describe = Some((op.to_string(), String::new()));
             Ok(serde_json::Value::Null)
@@ -921,6 +940,8 @@ fn component_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, op: &str) {
         if b.clicked() {
             if kind == "brush" {
                 let _ = app.run("tool.brush", json!({"op": op}));
+            } else if kind == "subject" {
+                start_subject(app, ui.ctx(), op, false);
             } else {
                 let _ = app.run("mask.addComponent", json!({"op": op, "kind": kind}));
             }
