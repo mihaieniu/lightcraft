@@ -127,6 +127,9 @@ pub struct Encoded {
     backbone: Tensor,
     tracker: Option<tracker::Features>,
     detector: Option<detector::Features>,
+    /// How sharp each mask cell of the photo is ([`mask::sharpness_grid`], `MASK_SIDE²`; empty
+    /// when encoded from preprocessed pixels).
+    sharpness: Vec<f32>,
 }
 
 /// A predicted mask: `MASK_SIDE²` logits over the model's square input (which the image was
@@ -172,13 +175,14 @@ impl Sam3 {
     /// input like the reference preprocessing.
     pub fn encode(&self, rgb: &[u8], w: usize, h: usize) -> Result<Encoded> {
         let pixels = mask::preprocess(rgb, w, h, INPUT)?;
+        let sharpness = mask::sharpness_grid(&pixels, INPUT, MASK_SIDE);
         let pixels = Tensor::from_vec(pixels, (1, 3, INPUT, INPUT), &self.device)?;
-        self.encode_pixels(&pixels)
+        Ok(Encoded { sharpness, ..self.encode_pixels(&pixels)? })
     }
 
     /// Run the backbone on preprocessed pixels `[1, 3, 1008, 1008]` (−1..1).
     pub fn encode_pixels(&self, pixels: &Tensor) -> Result<Encoded> {
-        Ok(Encoded { backbone: self.backbone.forward(&pixels.to_device(&self.device)?)?, tracker: None, detector: None })
+        Ok(Encoded { backbone: self.backbone.forward(&pixels.to_device(&self.device)?)?, tracker: None, detector: None, sharpness: Vec::new() })
     }
 
     fn tracker_parts(&mut self) -> Result<(&neck::Neck, &tracker::Tracker)> {
@@ -277,6 +281,11 @@ impl Encoded {
     /// The backbone output `[1, 1024, 72, 72]` (tests).
     pub fn backbone(&self) -> &Tensor {
         &self.backbone
+    }
+
+    /// How sharp each mask cell is (`MASK_SIDE²`, or empty: unknown).
+    pub fn sharpness(&self) -> &[f32] {
+        &self.sharpness
     }
 }
 

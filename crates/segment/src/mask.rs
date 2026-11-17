@@ -98,6 +98,32 @@ pub fn preprocess(rgb: &[u8], w: usize, h: usize, side: usize) -> Result<Vec<f32
     Ok(out)
 }
 
+/// How sharp each of `out × out` cells of a preprocessed image is (`pixels`: [`preprocess`]'s
+/// `[3, side, side]`): the mean |4-neighbour Laplacian| of its luminance. In-focus detail scores
+/// high, blur and flat areas low. Empty for a short buffer or `out == 0`.
+pub fn sharpness_grid(pixels: &[f32], side: usize, out: usize) -> Vec<f32> {
+    let plane = side.saturating_mul(side);
+    if out == 0 || side < 3 || pixels.len() < plane.saturating_mul(3) {
+        return Vec::new();
+    }
+    let luma = |x: usize, y: usize| {
+        let i = y * side + x;
+        (0..3).map(|c| pixels.get(c * plane + i).copied().unwrap_or(0.0)).sum::<f32>() / 3.0
+    };
+    let (mut sum, mut n) = (vec![0f32; out * out], vec![0u32; out * out]);
+    for y in 1..side - 1 {
+        for x in 1..side - 1 {
+            let lap = (4.0 * luma(x, y) - luma(x - 1, y) - luma(x + 1, y) - luma(x, y - 1) - luma(x, y + 1)).abs();
+            let cell = (y * out / side) * out + x * out / side;
+            if let (Some(s), Some(k)) = (sum.get_mut(cell), n.get_mut(cell)) {
+                *s += lap;
+                *k += 1;
+            }
+        }
+    }
+    sum.iter().zip(&n).map(|(s, k)| if *k > 0 { s / *k as f32 } else { 0.0 }).collect()
+}
+
 /// Mask `logits` (`side × side`) resampled bilinearly (half-pixel centres) to `w × h` and
 /// mapped to 0..1 coverage (sigmoid).
 pub fn alpha(logits: &[f32], side: usize, w: usize, h: usize) -> Vec<f32> {
@@ -156,6 +182,27 @@ mod tests {
             }
         }
         assert!(preprocess(&[], 0, 0, 4).is_err());
+    }
+
+    /// Fine detail scores far above a flat area; bad sizes give nothing.
+    #[test]
+    fn sharp_cells_score_higher() {
+        let side = 64;
+        let mut p = vec![0f32; 3 * side * side];
+        for c in 0..3 {
+            for y in 0..side {
+                for x in 0..side {
+                    p[(c * side + y) * side + x] = if x < side / 2 { if (x + y) % 2 == 0 { 1.0 } else { -1.0 } } else { 0.2 };
+                }
+            }
+        }
+        let g = sharpness_grid(&p, side, 8);
+        assert_eq!(g.len(), 64);
+        let left = (0..8).flat_map(|y| (0..4).map(move |x| y * 8 + x)).map(|i| g[i]).fold(f32::INFINITY, f32::min);
+        let right = (0..8).flat_map(|y| (4..8).map(move |x| y * 8 + x)).map(|i| g[i]).fold(0f32, f32::max);
+        assert!(left > 10.0 * right.max(1e-6), "{left} vs {right}");
+        assert!(sharpness_grid(&[], side, 8).is_empty());
+        assert!(sharpness_grid(&p, side, 0).is_empty());
     }
 
     #[test]
