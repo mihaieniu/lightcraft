@@ -779,7 +779,8 @@ impl Session {
                         return;
                     }
                 };
-                let text = lightcraft_segment::SUBJECT_CONCEPTS.join(", ");
+                let text =
+                    lightcraft_segment::SUBJECT_CONCEPTS.iter().chain(lightcraft_segment::HELD_CONCEPTS).copied().collect::<Vec<_>>().join(", ");
                 c.shape = MaskShape::Prompt { text, seg: Some(seg), detail: Vec::new(), edge };
                 match self.set_develop(photo, d, "Find Subject") {
                     Ok(()) => polled.changed = true,
@@ -859,7 +860,7 @@ mod tests {
         let polled = send(&mut s, Ok(Some(seg_box(20, 5, 5, 15, 15))));
         assert!(polled.changed && polled.messages.is_empty());
         let MaskShape::Prompt { text, seg: Some(_), .. } = shape(&s) else { panic!("{:?}", shape(&s)) };
-        assert_eq!(text, "person, animal");
+        assert_eq!(text, "person, animal, bouquet");
         // a result for a mask that changed meanwhile is dropped
         let before = shape(&s);
         assert!(!send(&mut s, Ok(Some(seg_box(20, 0, 0, 4, 4)))).changed);
