@@ -41,6 +41,8 @@ pub const MAX_PAYLOAD: u64 = 64 * 1024 * 1024;
 pub const MIN_TOKEN: usize = 16;
 /// Consecutive failures after which a client stops asking.
 pub const MAX_FAILURES: u32 = 3;
+/// How long a failing server is left alone (see [`Client::usable`]).
+pub const COOLDOWN: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -83,6 +85,11 @@ fn same(a: &str, b: &str) -> bool {
         d |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
     }
     d == 0
+}
+
+/// An Immich asset id (a UUID) that is safe in a path and a URL.
+pub fn valid_asset_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn threads() -> u64 {
@@ -151,10 +158,16 @@ fn handle(stream: TcpStream, token: &str, builder: &(dyn Fn(&str) -> Result<Buil
                 json!({"ok": true, "v": PROTOCOL, "encode": crate::smart::ENCODE_VERSION, "look": crate::camera_preview::LOOK_VERSION, "threads": threads()})
             )?,
             Some("build") => {
-                let Some(asset) = req.get("asset").and_then(Value::as_str).filter(|a| !a.is_empty() && a.len() <= 128) else {
+                let Some(asset) = req.get("asset").and_then(Value::as_str) else {
                     fail(&mut w, None, "missing asset id")?;
                     break;
                 };
+                // never a path: the builder makes a folder of it
+                if !valid_asset_id(asset) {
+                    fail(&mut w, None, "bad asset id")?;
+                    w.flush()?;
+                    continue;
+                }
                 match builder(asset) {
                     Ok(b) if b.smart.len() as u64 <= MAX_PAYLOAD => {
                         writeln!(w, "{}", json!({"ok": true, "asset": asset, "probe": b.probe, "bytes": b.smart.len()}))?;
@@ -174,58 +187,87 @@ fn handle(stream: TcpStream, token: &str, builder: &(dyn Fn(&str) -> Result<Buil
     Ok(())
 }
 
+/// Why a request failed: the server could not be reached or misbehaved (counts toward giving up on it), or it
+/// refused this one request (a photo it can't build, a version mismatch).
+enum Failure {
+    Transport(String),
+    Refused(String),
+}
+
 /// A preview server's client. Every request opens its own connection, so one client can be shared by threads.
 #[derive(Debug)]
 pub struct Client {
     addr: String,
     token: String,
     failures: AtomicU32,
+    cooldown: Duration,
+    last_failure: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Client {
     pub fn new(addr: &str, token: &str) -> Self {
-        Client { addr: addr.to_string(), token: token.to_string(), failures: AtomicU32::new(0) }
+        Client {
+            addr: addr.to_string(),
+            token: token.to_string(),
+            failures: AtomicU32::new(0),
+            cooldown: COOLDOWN,
+            last_failure: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// How long a server that failed [`MAX_FAILURES`] times is left alone before it is asked again.
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
     }
 
     pub fn addr(&self) -> &str {
         &self.addr
     }
 
-    /// Whether asking is still worth it: false after [`MAX_FAILURES`] failures in a row (a success resets them).
+    /// Whether asking is still worth it: not after [`MAX_FAILURES`] failures to reach it in a row (a success resets
+    /// them), until the cooldown has passed. A server answering that one photo can't be built is not failing.
     pub fn usable(&self) -> bool {
         self.failures.load(Ordering::Relaxed) < MAX_FAILURES
+            || self.last_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none_or(|t| t.elapsed() >= self.cooldown)
     }
 
-    fn counted<T>(&self, r: Result<T, String>) -> Result<T, String> {
-        match &r {
-            Ok(_) => self.failures.store(0, Ordering::Relaxed),
-            Err(_) => {
+    fn counted<T>(&self, r: Result<T, Failure>) -> Result<T, String> {
+        match r {
+            Ok(v) => {
+                self.failures.store(0, Ordering::Relaxed);
+                Ok(v)
+            }
+            Err(Failure::Refused(e)) => Err(e),
+            Err(Failure::Transport(e)) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
+                *self.last_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+                Err(e)
             }
         }
-        r
     }
 
-    fn request(&self, op: &str, asset: Option<&str>) -> Result<(Value, BufReader<TcpStream>), String> {
-        let addr =
-            self.addr.to_socket_addrs().map_err(|e| format!("{}: {e}", self.addr))?.next().ok_or_else(|| format!("{}: no address", self.addr))?;
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| format!("{}: {e}", self.addr))?;
-        stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(READ_TIMEOUT)).map_err(|e| e.to_string())?;
-        let mut w = stream.try_clone().map_err(|e| e.to_string())?;
+    fn request(&self, op: &str, asset: Option<&str>) -> Result<(Value, BufReader<TcpStream>), Failure> {
+        let t = |e: String| Failure::Transport(format!("{}: {e}", self.addr));
+        let addr = self.addr.to_socket_addrs().map_err(|e| t(e.to_string()))?.next().ok_or_else(|| t("no address".into()))?;
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| t(e.to_string()))?;
+        stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(|e| t(e.to_string()))?;
+        stream.set_write_timeout(Some(READ_TIMEOUT)).map_err(|e| t(e.to_string()))?;
+        let mut w = stream.try_clone().map_err(|e| t(e.to_string()))?;
         let mut req = json!({"v": PROTOCOL, "token": self.token, "op": op});
         if let Some(a) = asset {
             req["asset"] = json!(a);
         }
-        writeln!(w, "{req}").and_then(|()| w.flush()).map_err(|e| format!("{}: {e}", self.addr))?;
+        writeln!(w, "{req}").and_then(|()| w.flush()).map_err(|e| t(e.to_string()))?;
         let mut r = BufReader::new(stream);
-        let line = read_line(&mut r)
-            .map_err(|e| format!("{}: {e}", self.addr))?
-            .ok_or_else(|| format!("{}: the server closed the connection", self.addr))?;
-        let v: Value = serde_json::from_str(&line).map_err(|e| format!("{}: malformed answer: {e}", self.addr))?;
+        let line = read_line(&mut r).map_err(|e| t(e.to_string()))?.ok_or_else(|| t("the server closed the connection".into()))?;
+        let v: Value = serde_json::from_str(&line).map_err(|e| t(format!("malformed answer: {e}")))?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             let e = v.get("error").and_then(Value::as_str).unwrap_or("refused");
-            return Err(format!("{}: {e}", self.addr));
+            // an answer about one photo is not the server failing; a busy, refusing or confused one is
+            let about_one = v.get("asset").is_some_and(|a| !a.is_null()) || e == "bad asset id";
+            let msg = format!("{}: {e}", self.addr);
+            return Err(if about_one { Failure::Refused(msg) } else { Failure::Transport(msg) });
         }
         Ok((v, r))
     }
@@ -237,10 +279,10 @@ impl Client {
             let h = Hello { v: n("v"), encode: n("encode"), look: n("look"), threads: n("threads").max(1) };
             let ours = (PROTOCOL, crate::smart::ENCODE_VERSION, u64::from(crate::camera_preview::LOOK_VERSION));
             if (h.v, h.encode, h.look) != ours {
-                return Err(format!(
+                return Err(Failure::Refused(format!(
                     "{}: the server builds smart previews of another version (protocol {}, encoding {}, look {}; this build {}, {}, {}): update both from the same revision",
                     self.addr, h.v, h.encode, h.look, ours.0, ours.1, ours.2
-                ));
+                )));
             }
             Ok(h)
         });
@@ -249,17 +291,18 @@ impl Client {
 
     /// Asset `asset`'s probe and smart preview.
     pub fn build(&self, asset: &str) -> Result<Built, String> {
+        let t = |e: String| Failure::Transport(format!("{}: {e}", self.addr));
         let r = self.request("build", Some(asset)).and_then(|(v, mut r)| {
-            let bytes = v.get("bytes").and_then(Value::as_u64).ok_or_else(|| format!("{}: answer without a payload size", self.addr))?;
+            let bytes = v.get("bytes").and_then(Value::as_u64).ok_or_else(|| t("answer without a payload size".into()))?;
             if bytes > MAX_PAYLOAD {
-                return Err(format!("{}: a smart preview of {bytes} bytes is too large", self.addr));
+                return Err(t(format!("a smart preview of {bytes} bytes is too large")));
             }
             let probe: ProbeInfo =
-                serde_json::from_value(v.get("probe").cloned().unwrap_or(Value::Null)).map_err(|e| format!("{}: malformed probe: {e}", self.addr))?;
+                serde_json::from_value(v.get("probe").cloned().unwrap_or(Value::Null)).map_err(|e| t(format!("malformed probe: {e}")))?;
             let mut smart = Vec::new();
-            r.by_ref().take(bytes).read_to_end(&mut smart).map_err(|e| format!("{}: {e}", self.addr))?;
+            r.by_ref().take(bytes).read_to_end(&mut smart).map_err(|e| t(e.to_string()))?;
             if smart.len() as u64 != bytes {
-                return Err(format!("{}: the smart preview was cut short", self.addr));
+                return Err(t("the smart preview was cut short".into()));
             }
             Ok(Built { probe, smart })
         });

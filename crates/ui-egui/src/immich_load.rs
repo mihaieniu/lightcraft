@@ -245,6 +245,10 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             log::info!("Immich: {} smart previews not shown for a while were deleted ({} bytes)", gone.removed, gone.bytes);
         }
     }
+    // smart previews the preview server couldn't make (it went away mid-fetch) are built here
+    if app.session.immich_previews.as_ref().is_some_and(|(rp, _)| rp.has_queued()) {
+        app.session.build_queued_immich_previews();
+    }
     let Some(mut task) = app.immich.task.take() else { return };
     // the view moved on: nothing more to add
     let shown = app.session.source == lightcraft_engine::LibrarySource::Immich && app.session.immich_view.as_ref().is_some_and(|v| v.id == task.id);

@@ -20,11 +20,20 @@ pub struct RemotePreviews {
     smart_dir: Mutex<Option<PathBuf>>,
     /// Immich photos probed here instead: their smart previews are built here.
     local_queue: Mutex<HashSet<String>>,
+    /// The server's greeting: `None` not yet (or it could not be reached), `Some(false)` it builds smart previews of
+    /// another version and is never asked to build.
+    greeted: Mutex<Option<bool>>,
 }
 
 impl RemotePreviews {
     pub fn new(addr: &str, token: &str) -> Self {
-        RemotePreviews { client: Client::new(addr, token), ids: Mutex::default(), smart_dir: Mutex::default(), local_queue: Mutex::default() }
+        RemotePreviews {
+            client: Client::new(addr, token),
+            ids: Mutex::default(),
+            smart_dir: Mutex::default(),
+            local_queue: Mutex::default(),
+            greeted: Mutex::default(),
+        }
     }
 
     /// Photos about to be imported (local path, asset id), and the smart previews folder of the open library
@@ -34,9 +43,37 @@ impl RemotePreviews {
         *self.smart_dir.lock().unwrap_or_else(PoisonError::into_inner) = smart_dir;
     }
 
-    /// Whether the server stopped being asked (it is off or keeps failing): the laptop builds instead.
+    /// Whether the server stopped being asked (it is off, keeps failing, or is of another version): the laptop builds
+    /// instead.
     pub fn fallback_active(&self) -> bool {
-        !self.client.usable()
+        !self.client.usable() || *self.greeted.lock().unwrap_or_else(PoisonError::into_inner) == Some(false)
+    }
+
+    /// Whether the server may be asked to build: reachable, and greeted once as building smart previews exactly as
+    /// this build does (a server of another revision is never asked).
+    pub fn ready(&self) -> bool {
+        if !self.client.usable() {
+            return false;
+        }
+        let mut g = self.greeted.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.is_none() {
+            match self.client.hello() {
+                Ok(_) => *g = Some(true),
+                Err(e) => {
+                    log::warn!("preview server: {e}");
+                    // a refusal at the greeting (another version) is final; an unreachable server is asked again later
+                    if self.client.usable() {
+                        *g = Some(false);
+                    }
+                }
+            }
+        }
+        *g == Some(true)
+    }
+
+    /// Whether Immich photos wait to have their smart previews built here.
+    pub fn has_queued(&self) -> bool {
+        !self.local_queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
     /// The Immich photos probed here since the last call.
@@ -49,7 +86,7 @@ impl RemotePreviews {
     fn remote(&self, path: &str) -> Option<crate::media::ProbeInfo> {
         let asset = self.ids.lock().unwrap_or_else(PoisonError::into_inner).get(path).cloned()?;
         let dir = self.smart_dir.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
-        if !self.client.usable() {
+        if !self.ready() {
             return None;
         }
         let built = match self.client.build(&asset) {
@@ -70,21 +107,25 @@ impl RemotePreviews {
             log::warn!("smart preview {}: {e}", to.display());
             return None;
         }
-        Some(built.probe)
+        // the file's size and date as they are here: the server's copy was written just now
+        let mut probe = built.probe;
+        if let Ok(meta) = std::fs::metadata(path) {
+            probe.file_size = meta.len();
+            probe.file_modified = crate::files::modified_iso(&meta);
+        }
+        Some(probe)
     }
 
     /// Asset `asset`'s smart preview from the server, written to `to` (the photo's own smart preview path).
     pub fn fetch_into(&self, asset: &str, to: &std::path::Path) -> Result<(), String> {
+        if !self.ready() {
+            return Err("the preview server is not available".into());
+        }
         let built = self.client.build(asset)?;
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         lightcraft_catalog::safe_file::write_atomic(to, &built.smart).map_err(|e| format!("{}: {e}", to.display()))
-    }
-
-    /// Whether the server is still worth asking.
-    pub fn usable(&self) -> bool {
-        self.client.usable()
     }
 
     /// Have these Immich photos' smart previews built here instead.

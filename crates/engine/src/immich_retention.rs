@@ -150,8 +150,20 @@ pub fn keep_days(s: &Session) -> u32 {
 fn remove(s: &mut Session, now: i64, stale: impl Fn(Option<i64>) -> bool) -> Expired {
     let mut o = load(s);
     let mut out = Expired::default();
+    // a smart preview is named by content, so photos with the same bytes share it: it stays while any of them is
+    // outside Immich or pinned
+    let roots = &s.media.smart_first;
+    let kept: std::collections::HashSet<String> = s
+        .catalog
+        .photos()
+        .filter(|p| match &p.source {
+            Source::File { path } => !roots.iter().any(|r| crate::immich::is_under(path, r)) || pinned(s, &o, path),
+            _ => false,
+        })
+        .map(|p| crate::smart::file_name(p))
+        .collect();
     for (_, key, sp, local) in immich_photos(s) {
-        if pinned(s, &o, &local) || !sp.is_file() {
+        if kept.contains(&key) || pinned(s, &o, &local) || !sp.is_file() {
             continue;
         }
         let shown = o.shown.get(&key).copied();

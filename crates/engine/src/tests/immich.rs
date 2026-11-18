@@ -707,3 +707,75 @@ fn photos_already_here_get_their_smart_previews_from_the_worker() {
     assert_eq!(smart_count(&mut s), 3);
     assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
+
+// ---- review fixes ----
+
+/// A server that greets with another smart-preview encoding, and counts the builds it is asked for.
+fn other_revision_worker() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let b = builds.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { continue };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap_or(0) > 0 {
+                if line.contains("\"build\"") {
+                    b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = writeln!(w, "{}", json!({"ok": false, "error": "not expected"}));
+                } else {
+                    let _ = writeln!(w, "{}", json!({"ok": true, "v": 1, "encode": 999, "look": 1, "threads": 1}));
+                }
+                line.clear();
+            }
+        }
+    });
+    (addr, builds)
+}
+
+#[test]
+fn a_server_of_another_revision_is_never_asked_to_build() {
+    let (addr, builds) = other_revision_worker();
+    let (mut s, calls, _d) = worker_session("other-revision", Some(&addr));
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 0, "refused at its greeting");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3, "every photo was probed here");
+    assert_eq!(s.execute("immich.cacheStats", &json!({})).unwrap()["pcUnavailable"], true);
+}
+
+#[test]
+fn when_the_pc_dies_during_the_fetch_the_rest_is_built_here() {
+    let (mut s, _calls, _d) = worker_session("fetch-dies", None);
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    let (addr, _) = worker(1);
+    let mut cfg = s.immich.clone().unwrap();
+    cfg.worker = Some(crate::immich::WorkerConfig { addr, token: "a-long-shared-token-123".into() });
+    s.set_immich(Some(cfg));
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    // the fetch threads finish; what failed is queued and built here on the next pass
+    for _ in 0..500 {
+        s.build_queued_immich_previews();
+        if smart_count(&mut s) == 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(smart_count(&mut s), 3);
+}
+
+#[test]
+fn the_servers_probe_keeps_the_local_files_date() {
+    let (addr, _) = worker(usize::MAX);
+    let (s, _calls, d) = worker_session("file-date", Some(&addr));
+    let a = d.join("a.png").to_string_lossy().to_string();
+    s.register_immich_assets(&[(a.clone(), "id-a-png".into())]);
+    let probe = (s.media.file_probe.clone().unwrap())(&a).unwrap();
+    let meta = std::fs::metadata(&a).unwrap();
+    assert_eq!(probe.file_size, meta.len());
+    assert!(probe.file_modified.is_some(), "the local file's date, not the server's download time");
+    let local = crate::files::modified_iso(&meta);
+    assert_eq!(probe.file_modified, local);
+}

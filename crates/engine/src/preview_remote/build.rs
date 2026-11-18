@@ -12,6 +12,10 @@ use super::{Builder, Built};
 /// Build Immich assets of the server `cfg` names, downloading each original into a folder of its own under `tmp`.
 pub fn immich_builder(cfg: crate::immich::Config, tmp: PathBuf) -> Builder {
     Arc::new(move |asset: &str| {
+        // the id becomes a folder that is deleted afterwards: never `..` or a path
+        if !super::valid_asset_id(asset) {
+            return Err(format!("bad asset id {asset:?}"));
+        }
         let dir = tmp.join(asset);
         let r = build_one(&cfg, asset, &dir);
         // the original is never kept: the server's disk holds no photos

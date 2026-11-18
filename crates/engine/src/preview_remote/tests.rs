@@ -177,3 +177,54 @@ fn builder_cleans_temp_dir() {
     assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "nothing left in {}", tmp.display());
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---- review fixes ----
+
+#[test]
+fn a_bad_asset_id_never_reaches_the_builder() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = called.clone();
+    let builder: Builder = Arc::new(move |a: &str| {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(built(a))
+    });
+    std::thread::spawn(move || serve(l, TOKEN.into(), builder, 8, Arc::new(AtomicBool::new(false))));
+    let e = Client::new(&addr, TOKEN).build("../..").unwrap_err();
+    assert!(e.contains("asset id"), "{e}");
+    assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn the_immich_builder_deletes_nothing_outside_its_folder() {
+    let base = temp_dir("escape");
+    let tmp = base.join("tmp");
+    std::fs::create_dir_all(base.join("keep")).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let builder = immich_builder(immich_cfg("http://127.0.0.1:1"), tmp);
+    assert!(builder("../keep").is_err());
+    assert!(base.join("keep").is_dir(), "a folder beside the temp folder survives");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn asset_errors_dont_turn_the_server_off() {
+    let c = Client::new(&start(), TOKEN);
+    for _ in 0..5 {
+        assert!(c.build("bad").is_err());
+    }
+    assert!(c.usable(), "a server answering about bad files is still worth asking");
+}
+
+#[test]
+fn a_failed_server_is_tried_again_after_the_cooldown() {
+    let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let c = Client::new(&addr, TOKEN).with_cooldown(std::time::Duration::from_millis(50));
+    for _ in 0..3 {
+        let _ = c.build("a");
+    }
+    assert!(!c.usable());
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(c.usable(), "asked again after the cooldown");
+}

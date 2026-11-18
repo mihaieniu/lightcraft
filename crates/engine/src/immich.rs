@@ -585,7 +585,7 @@ impl crate::Session {
         if jobs.is_empty() {
             return;
         }
-        if !rp.usable() {
+        if !rp.ready() {
             rp.queue_paths(jobs.into_iter().map(|(p, _, _)| p));
             return;
         }
@@ -600,8 +600,10 @@ impl crate::Session {
             let spawned = std::thread::Builder::new().name("immich-previews".into()).spawn(move || {
                 loop {
                     let Some((path, asset, to)) = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop() else { break };
+                    // the server went away or can't do this one: built here instead (the app picks the queue up)
                     if let Err(e) = rp.fetch_into(&asset, &to) {
                         log::info!("smart preview of {path} from the PC: {e}");
+                        rp.queue_paths([path]);
                     }
                     guard.progress(done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1, total);
                 }
@@ -615,6 +617,10 @@ impl crate::Session {
     /// Build here, in the background, the smart previews of the Immich photos the preview server didn't do.
     pub fn build_queued_immich_previews(&mut self) {
         let Some((rp, _)) = &self.immich_previews else { return };
+        // one build at a time: the queue waits for the running one
+        if self.preview_build.as_ref().is_some_and(|b| b.running()) {
+            return;
+        }
         let queued: std::collections::HashSet<String> = rp.take_local_queue().into_iter().collect();
         if queued.is_empty() || self.media.smart_dir.is_none() {
             return;
