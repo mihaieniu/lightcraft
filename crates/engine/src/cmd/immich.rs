@@ -30,7 +30,9 @@ fn browse_album(s: &mut Session, p: &Value) -> Result<Value> {
     let found = crate::immich::album_files(&cfg, id, &AtomicBool::new(false)).map_err(|e| bad(C, e))?;
     // like library.browse: read in place, never bringing deleted photos back
     let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
+    s.register_immich_assets(&found.assets);
     let report = import_with(s, &found.files, &opts)?;
+    s.build_queued_immich_previews();
     let root = crate::immich::common_root(&found.files);
     // the album's folders count as browsed: their untouched photos aren't forgotten while it is in use
     s.note_browsed(&root, &found.files);

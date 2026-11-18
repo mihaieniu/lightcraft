@@ -33,6 +33,17 @@ pub struct Config {
     pub api_key: String,
     /// (folder as Immich sees it, the same folder here), longest Immich folder first.
     pub paths: Vec<(String, String)>,
+    /// A preview server (`lightcraft-cli preview-serve`) that builds smart previews of Immich photos (CRAFT-9).
+    pub worker: Option<WorkerConfig>,
+    /// The external libraries shown as "Lightroom" (by name); the others are "Phone & cloud".
+    pub lightroom_libraries: Vec<String>,
+}
+
+/// Where the preview server is, and the token it wants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerConfig {
+    pub addr: String,
+    pub token: String,
 }
 
 /// An Immich album.
@@ -122,7 +133,24 @@ impl Config {
             Some(_) => return Err("paths: give an object of folder → folder".into()),
         }
         paths.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-        Ok(Config { url, api_key, paths })
+        let worker = match v.get("worker") {
+            None | Some(Value::Null) => None,
+            Some(w) => {
+                let addr = w.get("addr").and_then(Value::as_str).filter(|a| !a.trim().is_empty()).ok_or("worker: give its `addr` (host:port)")?;
+                let f = w.get("token_file").and_then(Value::as_str).ok_or("worker: give `token_file`")?;
+                let f = expand_home(f, home)?;
+                let token = std::fs::read_to_string(&f).map_err(|e| format!("worker token file {f}: {e}"))?.trim().to_string();
+                if token.is_empty() {
+                    return Err(format!("worker token file {f} is empty"));
+                }
+                Some(WorkerConfig { addr: addr.trim().to_string(), token })
+            }
+        };
+        let lightroom_libraries = match v.get("lightroom_libraries").and_then(Value::as_array) {
+            Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            None => vec!["Lightroom".to_string()],
+        };
+        Ok(Config { url, api_key, paths, worker, lightroom_libraries })
     }
 
     /// A path as Immich reports it, here; `None` when no mapped folder holds it.
@@ -152,11 +180,18 @@ pub(crate) fn parse_albums(v: &Value) -> Result<Vec<Album>, String> {
         .collect()
 }
 
-/// A `POST /api/search/metadata` page: its assets' `originalPath`s and the next page.
-pub(crate) fn parse_page(v: &Value) -> Result<(Vec<String>, Option<u32>), String> {
+/// A `POST /api/search/metadata` page: its assets' (`originalPath`, `id`) (the id empty when Immich sent none) and the
+/// next page.
+pub(crate) fn parse_page(v: &Value) -> Result<(Vec<(String, String)>, Option<u32>), String> {
     let assets = v.get("assets").ok_or("Immich sent no `assets`")?;
     let items = assets.get("items").and_then(Value::as_array).ok_or("Immich sent no `assets.items`")?;
-    let paths = items.iter().filter_map(|i| i.get("originalPath").and_then(Value::as_str)).map(str::to_string).collect();
+    let paths = items
+        .iter()
+        .filter_map(|i| {
+            let path = i.get("originalPath").and_then(Value::as_str)?;
+            Some((path.to_string(), i.get("id").and_then(Value::as_str).unwrap_or_default().to_string()))
+        })
+        .collect();
     let next = match assets.get("nextPage") {
         Some(Value::String(s)) => s.parse::<u32>().ok(),
         Some(Value::Number(n)) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
@@ -259,6 +294,12 @@ impl<'a> Client<'a> {
 
     /// Page `page` (from 1) of album `id`'s photos: their paths as Immich sees them, and the next page.
     pub fn album_page(&self, id: &str, page: u32) -> Result<(Vec<String>, Option<u32>), String> {
+        let (assets, next) = self.album_page_assets(id, page)?;
+        Ok((assets.into_iter().map(|(p, _)| p).collect(), next))
+    }
+
+    /// [`Self::album_page`] with each photo's asset id.
+    pub fn album_page_assets(&self, id: &str, page: u32) -> Result<(Vec<(String, String)>, Option<u32>), String> {
         let body = json!({"albumIds": [id], "type": "IMAGE", "size": PAGE_SIZE, "page": page, "withExif": false});
         parse_page(&self.json("POST", "/api/search/metadata", Some(&body))?)
     }
@@ -335,6 +376,8 @@ pub struct AlbumFiles {
     pub missing: usize,
     /// Files LightCraft doesn't open.
     pub skipped: usize,
+    /// (local path, Immich asset id) of [`Self::files`] that Immich gave an id.
+    pub assets: Vec<(String, String)>,
 }
 
 /// Most pages read for one album (1,000 photos each).
@@ -346,13 +389,18 @@ pub fn album_files(cfg: &Config, id: &str, cancel: &AtomicBool) -> Result<AlbumF
     let mut out = AlbumFiles::default();
     let mut page = 1;
     for _ in 0..MAX_PAGES {
-        let (paths, next) = client.album_page(id, page)?;
-        for p in paths {
+        let (assets, next) = client.album_page_assets(id, page)?;
+        for (p, asset) in assets {
             match cfg.to_local(&p) {
                 None => out.unmapped += 1,
                 Some(l) if !Path::new(&l).is_file() => out.missing += 1,
                 Some(l) if !crate::import::is_supported(Path::new(&l)) => out.skipped += 1,
-                Some(l) => out.files.push(l),
+                Some(l) => {
+                    if !asset.is_empty() {
+                        out.assets.push((l.clone(), asset));
+                    }
+                    out.files.push(l)
+                }
             }
         }
         match next {
@@ -378,6 +426,48 @@ pub fn common_root(files: &[String]) -> String {
 }
 
 impl crate::Session {
+    /// Set Immich up (`None`: no Immich). With a `worker`, the file probe asks it about Immich photos
+    /// ([`crate::immich_previews`]); without one the probe is the plain one again.
+    pub fn set_immich(&mut self, cfg: Option<Config>) {
+        if let Some((_, native)) = self.immich_previews.take() {
+            self.media.file_probe = native;
+        }
+        if let Some(w) = cfg.as_ref().and_then(|c| c.worker.as_ref()) {
+            let rp = std::sync::Arc::new(crate::immich_previews::RemotePreviews::new(&w.addr, &w.token));
+            let native = self.media.file_probe.clone();
+            if let Some(n) = native.clone() {
+                self.media.file_probe = Some(crate::immich_previews::wrap_probe(n, rp.clone()));
+            }
+            self.immich_previews = Some((rp, native));
+        }
+        self.immich = cfg;
+    }
+
+    /// Tell the preview server's client which photos are about to be imported.
+    pub fn register_immich_assets(&self, assets: &[(String, String)]) {
+        if let Some((rp, _)) = &self.immich_previews {
+            rp.register(assets, self.media.smart_dir.clone());
+        }
+    }
+
+    /// Build here, in the background, the smart previews of the Immich photos the preview server didn't do.
+    pub fn build_queued_immich_previews(&mut self) {
+        let Some((rp, _)) = &self.immich_previews else { return };
+        let queued: std::collections::HashSet<String> = rp.take_local_queue().into_iter().collect();
+        if queued.is_empty() || self.media.smart_dir.is_none() {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .catalog
+            .photos()
+            .filter(|p| matches!(&p.source, lightcraft_catalog::Source::File { path } if queued.contains(path)))
+            .map(|p| p.id.0)
+            .collect();
+        if let Err(e) = self.execute("library.smartPreviews", &json!({"ids": ids, "background": true})) {
+            log::warn!("smart previews of Immich photos: {e}");
+        }
+    }
+
     /// Switch the view to Immich album `id` (empty until [`crate::Session::add_to_immich_view`] adds its photos),
     /// its photos under `root`.
     pub fn show_immich_album(&mut self, id: &str, name: &str, root: String) {

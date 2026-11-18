@@ -78,6 +78,9 @@ pub fn start(app: &mut LightcraftApp, id: &str, name: &str) -> Result<(), String
     app.session.show_immich_album(id, name, String::new());
     let (tx, rx) = channel();
     let (c, album) = (cancel.clone(), id.to_string());
+    // the preview server (CRAFT-9) is told which photos the import will ask it about
+    let remote = app.session.immich_previews.as_ref().map(|(rp, _)| rp.clone());
+    let smart_dir = app.session.media.smart_dir.clone();
     let work = move || {
         let found = match lightcraft_engine::immich::album_files(&cfg, &album, &c) {
             Ok(f) => f,
@@ -86,6 +89,9 @@ pub fn start(app: &mut LightcraftApp, id: &str, name: &str) -> Result<(), String
                 return;
             }
         };
+        if let Some(rp) = &remote {
+            rp.register(&found.assets, smart_dir);
+        }
         let files = found.files.clone();
         let root = lightcraft_engine::immich::common_root(&files);
         if tx.send(Msg::Found { root, found }).is_err() {
@@ -157,6 +163,8 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 return;
             }
             Ok(Msg::Done) | Err(TryRecvError::Disconnected) => {
+                // what the preview server didn't do is built here
+                app.session.build_queued_immich_previews();
                 // the album's folders count as browsed: their untouched photos aren't forgotten while it is in use
                 let root = app.session.immich_view.as_ref().map(|v| v.root.clone()).unwrap_or_default();
                 app.session.note_browsed(&root, &task.found.files);

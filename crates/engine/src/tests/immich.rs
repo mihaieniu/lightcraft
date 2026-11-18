@@ -391,3 +391,123 @@ fn browsing_an_album_records_its_folders_as_browsed() {
     s.execute("immich.browseAlbum", &json!({"id": "a"})).unwrap();
     assert!(s.catalog.last_browsed(d.to_str().unwrap()).is_some(), "untouched album photos aren't forgotten while the album is in use");
 }
+
+// ---- smart previews from a worker (CRAFT-9) ----
+
+#[test]
+fn config_reads_worker_and_token_file() {
+    let d = temp_dir("worker-config");
+    std::fs::write(d.join("tok"), "  a-long-shared-token-123\n").unwrap();
+    let text = json!({"url": "http://h", "worker": {"addr": "10.0.0.5:7991", "token_file": "~/tok"}}).to_string();
+    let c = Config::from_json(&text, Some("k".into()), Some(&d)).unwrap();
+    let w = c.worker.unwrap();
+    assert_eq!((w.addr.as_str(), w.token.as_str()), ("10.0.0.5:7991", "a-long-shared-token-123"));
+    assert_eq!(c.lightroom_libraries, vec!["Lightroom".to_string()]);
+    assert!(Config::from_json(&json!({"url": "http://h"}).to_string(), Some("k".into()), Some(&d)).unwrap().worker.is_none());
+}
+
+/// A page whose items carry ids (`"id-<file name>"`).
+fn page_with_ids(paths: &[&str]) -> String {
+    let items: Vec<_> = paths
+        .iter()
+        .map(|p| json!({"originalPath": p, "id": format!("id-{}", p.rsplit('/').next().unwrap().replace('.', "-")), "type": "IMAGE"}))
+        .collect();
+    json!({"assets": {"items": items, "nextPage": null}}).to_string()
+}
+
+/// A real proxy for a small image, as a worker would send.
+fn proxy_bytes(seed: u8) -> Vec<u8> {
+    let mut img = lightcraft_raster::Rgb32f::new(16, 12);
+    img.data.iter_mut().for_each(|px| *px = [0.2, 0.3, f32::from(seed) / 255.0]);
+    crate::smart::encode(&img, None).unwrap()
+}
+
+/// A worker whose builder answers `answers` builds, then stops listening (the PC went away).
+fn worker(answers: usize) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use crate::preview_remote::{Built, serve};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let b = built.clone();
+    let builder: crate::preview_remote::Builder = Arc::new(move |asset: &str| {
+        let n = b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= answers {
+            return Err("gone".into());
+        }
+        let probe = crate::media::ProbeInfo {
+            width: 16,
+            height: 12,
+            format: "png".into(),
+            kind: lightcraft_catalog::MediaKind::Image,
+            content_hash: Some(format!("{:032x}", n + 1)),
+            ..Default::default()
+        };
+        Ok(Built { probe, smart: proxy_bytes(asset.len() as u8) })
+    });
+    std::thread::spawn(move || serve(l, "a-long-shared-token-123".into(), builder, 8, Arc::new(AtomicBool::new(false))));
+    (addr, built)
+}
+
+/// Album "a" of three photos in a mapped temp folder, a library on disk, a native probe that counts its calls,
+/// and (with `worker_addr`) the worker set up.
+fn worker_session(tag: &str, worker_addr: Option<&str>) -> (crate::Session, Arc<std::sync::atomic::AtomicUsize>, PathBuf) {
+    let d = temp_dir(tag);
+    for (i, n) in ["a.png", "b.png", "c.png"].iter().enumerate() {
+        png(&d.join(n), i as u8);
+    }
+    let body = page_with_ids(&["/srv/lib/a.png", "/srv/lib/b.png", "/srv/lib/c.png"]);
+    let (url, _) = fake_immich(vec![("POST /api/search/metadata", 200, body)]);
+    let mut s = crate::Session::new().with_fs();
+    s.open_library(d.join("library"), false).unwrap();
+    let native = s.media.file_probe.clone().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    s.media.file_probe = Some(Arc::new(move |p: &str| {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        native(p)
+    }));
+    let mut cfg = config(&url, &[("/srv/lib", d.to_str().unwrap())]);
+    cfg.worker = worker_addr.map(|a| crate::immich::WorkerConfig { addr: a.into(), token: "a-long-shared-token-123".into() });
+    s.set_immich(Some(cfg));
+    (s, calls, d)
+}
+
+fn smart_count(s: &mut crate::Session) -> usize {
+    let ids = s.visible().to_vec();
+    ids.iter().filter(|id| crate::cmd::previews::has_smart_preview(s, **id)).count()
+}
+
+#[test]
+fn browse_with_worker_reads_no_original() {
+    let (addr, _) = worker(usize::MAX);
+    let (mut s, calls, _d) = worker_session("worker-all", Some(&addr));
+    let r = s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(r["photos"], 3, "{r}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no original was probed here");
+    assert_eq!(smart_count(&mut s), 3, "every photo has the worker's smart preview");
+}
+
+#[test]
+fn server_dropping_mid_batch_falls_back() {
+    let (addr, _) = worker(1);
+    let (mut s, calls, _d) = worker_session("worker-drop", Some(&addr));
+    let r = s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(r["photos"], 3, "{r}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "the two the worker didn't answer were probed here");
+    // (built in the background)
+    for _ in 0..500 {
+        if s.execute("library.previewProgress", &json!({})).unwrap()["running"] != true {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(smart_count(&mut s), 3, "and their smart previews were built here");
+}
+
+#[test]
+fn no_worker_config_keeps_todays_path() {
+    let (mut s, calls, _d) = worker_session("worker-none", None);
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(smart_count(&mut s), 0, "no smart previews are made without a worker");
+}

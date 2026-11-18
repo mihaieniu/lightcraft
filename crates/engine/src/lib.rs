@@ -47,6 +47,8 @@ pub mod fonts;
 pub mod guard;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod immich;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod immich_previews;
 pub mod import;
 mod import_move;
 pub mod lens_profiles;
@@ -323,6 +325,9 @@ pub struct Session {
     /// Rescans of the Immich libraries imports and exports write into.
     #[cfg(not(target_arch = "wasm32"))]
     pub immich_rescans: immich::Rescans,
+    /// Smart previews of Immich photos from a preview server (`immich.json` → `worker`), and the file probe it wraps.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich_previews: Option<(std::sync::Arc<immich_previews::RemotePreviews>, Option<media::FileProbe>)>,
     /// The folder the [`LibrarySource::LibraryFolder`] view shows: the library's photos imported
     /// from it and from the folders inside it.
     pub library_folder: Option<String>,
@@ -528,6 +533,8 @@ impl Session {
             immich_view: None,
             #[cfg(not(target_arch = "wasm32"))]
             immich_rescans: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            immich_previews: None,
             library_folder: None,
             previous_active: None,
             copy_groups: lightcraft_develop::SettingsGroup::default_copy(),
