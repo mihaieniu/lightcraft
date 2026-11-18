@@ -768,6 +768,7 @@ fn immich_field(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog
                 }
             });
             crate::widgets::name_combo(&combo.response, crate::i18n::tr("Send to Immich"));
+            register(ui, "combo:importImmich", combo.response.rect);
             if d.immich_album.is_none() && !d.new_immich_album.is_empty() {
                 let r = ui.add(egui::TextEdit::singleline(&mut d.new_immich_album).desired_width(f32::INFINITY));
                 register(ui, "field:importImmichName", r.rect);
