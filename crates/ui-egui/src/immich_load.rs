@@ -35,6 +35,12 @@ pub struct State {
     covers_rx: Option<Receiver<(String, Option<egui::ColorImage>)>>,
     /// Where covers are cached (`None`: [`lightcraft_engine::immich::covers_dir`]).
     pub covers_dir: Option<std::path::PathBuf>,
+    /// Imports being sent to Immich ([`crate::immich_upload_ui`]).
+    pub upload: Option<crate::immich_upload_ui::Upload>,
+    /// Where the pending sends are kept (`None`: [`lightcraft_engine::immich_upload::jobs_file`]).
+    pub uploads_file: Option<std::path::PathBuf>,
+    /// Sends left from before were picked up.
+    pub uploads_resumed: bool,
 }
 
 type Listing = (Result<Vec<(Album, Group)>, String>, Option<Folders>);
@@ -75,6 +81,11 @@ impl FolderTree {
 }
 
 impl State {
+    /// Photos are being sent to Immich.
+    pub fn uploading(&self) -> bool {
+        self.upload.is_some()
+    }
+
     /// The album list is being fetched.
     pub fn refreshing(&self) -> bool {
         self.albums_rx.is_some()

@@ -65,6 +65,10 @@ pub struct ImportDialog {
     pub album: Option<u64>,
     /// …or a new album with this name.
     pub new_album: String,
+    /// Send the photos to this Immich album (id) once imported (CRAFT-11)…
+    pub immich_album: Option<String>,
+    /// …or to a new Immich album with this name (made as `L_<name>`).
+    pub new_immich_album: String,
     /// Preset id ("" = none).
     pub preset: String,
     /// An optional batch-edit recipe: develop control id → value (only controls moved off their
@@ -424,6 +428,31 @@ mod tests {
         assert_eq!(recipe.get("light.exposure"), Some(&1.25), "a new value replaces the old");
         note_recipe_value(&mut recipe, spec, spec.default);
         assert!(recipe.is_empty(), "{recipe:?}");
+    }
+
+    /// An import to an Immich album is a copy into the laptop's import folder, by date, and keeps its target for the
+    /// upload that follows (CRAFT-11).
+    #[test]
+    fn an_immich_album_import_copies_into_the_import_folder_by_date() {
+        let mut session = lightcraft_engine::Session::new();
+        session
+            .set_immich(Some(lightcraft_engine::immich::Config::from_json(r#"{"url": "http://h", "paths": {}}"#, Some("k".into()), None).unwrap()));
+        let mut app = crate::LightcraftApp::new(session, crate::Services { png: None, ..Default::default() });
+        let mut d = dialog();
+        d.new_immich_album = "Shoot".into();
+        start(&mut app, &d).unwrap();
+        let t = app.import.take().unwrap();
+        assert_eq!(t.params["mode"], "copy", "{}", t.params);
+        assert_eq!(t.params["organize"], "date");
+        let dest = t.params["destination"].as_str().unwrap().to_string();
+        assert!(dest.ends_with("Pictures/LightCraft Imports"), "{dest}");
+        assert_eq!(t.immich, Some((lightcraft_engine::immich_upload::Target::New("Shoot".into()), dest)));
+        // without a target nothing changes
+        let d = dialog();
+        start(&mut app, &d).unwrap();
+        let t = app.import.take().unwrap();
+        assert_eq!(t.params["mode"], "add");
+        assert_eq!(t.immich, None);
     }
 
     /// `start` hands `library.import` a `recipe` only when the dialog has one.

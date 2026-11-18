@@ -48,6 +48,11 @@ pub struct ImportTask {
     run: Option<ImportRun>,
     /// The import's row in the activity stack (its ✕ and `activity.cancel` set the run's cancel flag).
     guard: Option<lightcraft_engine::activity::TaskGuard>,
+    /// The Immich album the photos go to once imported, and the folder they are copied into (CRAFT-11).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich: Option<(lightcraft_engine::immich_upload::Target, String)>,
+    /// The photos it added (kept for [`ImportTask::immich`]).
+    imported_ids: Vec<u64>,
 }
 
 impl ImportTask {
@@ -219,7 +224,13 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
         let r = app.session.execute("album.create", &json!({"name": d.new_album.trim()})).map_err(|e| e.to_string())?;
         album = r["id"].as_u64();
     }
-    let mode = match (d.copy, d.move_files) {
+    // an Immich album: copied into the laptop's import folder by date, then sent to the server (CRAFT-11)
+    #[cfg(not(target_arch = "wasm32"))]
+    let immich = immich_target(app, d);
+    #[cfg(target_arch = "wasm32")]
+    let immich: Option<((), String)> = None;
+    let copy = d.copy || immich.is_some();
+    let mode = match (copy, d.move_files) {
         (false, _) => "add",
         (true, false) => "copy",
         (true, true) => "move",
@@ -240,12 +251,17 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
     if !d.metadata_preset.is_empty() {
         params["metadataPreset"] = json!(d.metadata_preset);
     }
-    if d.copy {
+    if copy {
         if !d.destination.trim().is_empty() {
             params["destination"] = json!(d.destination.trim());
         }
         if let Some(o) = d.organize_param()? {
             params["organize"] = json!(o);
+        }
+        // the server's Lightroom library is organized by day: the copies here are laid out the same way
+        if let Some((_, staging)) = &immich {
+            params["destination"] = json!(staging);
+            params["organize"] = json!("date");
         }
         if !d.rename.trim().is_empty() {
             params["rename"] = json!(d.rename.trim());
@@ -256,9 +272,30 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
         }
     }
     let total = queue.len();
-    app.import = Some(ImportTask::new(queue, params, undo0, false));
+    #[allow(unused_mut)]
+    let mut task = ImportTask::new(queue, params, undo0, false);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        task.immich = immich;
+    }
+    app.import = Some(task);
     app.renderer.forget_imports();
     Ok(json!({"importing": total}))
+}
+
+/// The Immich album `d` sends its photos to, and the folder here they are first copied into
+/// (`~/Pictures/LightCraft Imports`): `None` without Immich or without an album chosen.
+#[cfg(not(target_arch = "wasm32"))]
+fn immich_target(app: &LightcraftApp, d: &ImportDialog) -> Option<(lightcraft_engine::immich_upload::Target, String)> {
+    use lightcraft_engine::immich_upload::Target;
+    app.session.immich.as_ref()?;
+    let target = match (&d.immich_album, d.new_immich_album.trim()) {
+        (Some(id), _) => Target::Album(id.clone()),
+        (None, name) if !name.is_empty() => Target::New(name.to_string()),
+        _ => return None,
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    Some((target, home.join("Pictures").join("LightCraft Imports").to_string_lossy().to_string()))
 }
 
 /// Start importing `paths` (files or folders) in the background, e.g. dropped on the window.
@@ -364,6 +401,10 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightc
             for k in v["kept"].as_array().into_iter().flatten() {
                 log::warn!("import: kept {}: {}", k["path"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""));
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            if task.immich.is_some() {
+                task.imported_ids.extend(v["imported"].as_array().into_iter().flatten().filter_map(Value::as_u64));
+            }
             if task.first.is_none() {
                 task.first = ["imported", "restored"].iter().find_map(|k| v[*k].as_array().and_then(|a| a.first()).and_then(Value::as_u64));
             }
@@ -444,6 +485,22 @@ fn undo_label(task: &ImportTask) -> String {
 /// The import is done (or cancelled): one undo step, show and select the first photo (unless the
 /// user chose another meanwhile), say what happened.
 fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
+    // photos for an Immich album: sent to the server in the background
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((target, staging)) = task.immich.clone() {
+        let paths: Vec<String> = task
+            .imported_ids
+            .iter()
+            .filter_map(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(*id)))
+            .filter_map(|p| match &p.source {
+                lightcraft_catalog::Source::File { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        if !paths.is_empty() {
+            crate::immich_upload_ui::send(app, lightcraft_engine::immich_upload::Job::new(paths, staging, target));
+        }
+    }
     let steps = app.session.undo.len().saturating_sub(task.undo0);
     app.session.merge_undo(steps, &undo_label(&task));
     if task.auto || task.browse {

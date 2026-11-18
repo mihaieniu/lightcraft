@@ -300,3 +300,43 @@ fn albums_show_covers_names_and_years() {
     h.settle(T);
     assert!(top(&h, "source:immich:a2") < top(&h, "source:immich:a1"));
 }
+
+/// The photos of an import to an Immich album go to the server in the background: copied to its Lightroom folder,
+/// found after the scan, added to the album; the job leaves the pending list (CRAFT-11).
+#[test]
+fn import_to_a_new_immich_album_sends_the_photos() {
+    let dir = temp("upload");
+    let (staging, nas) = (dir.join("staging"), dir.join("nas"));
+    std::fs::create_dir_all(staging.join("2026/2026-11-18")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let file = staging.join("2026/2026-11-18/DSC1.ARW");
+    std::fs::write(&file, "raw").unwrap();
+    let url = fake_immich(vec![
+        ("GET /api/libraries", json!([{"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]}]).to_string()),
+        ("POST /api/libraries/L1/scan", String::new()),
+        (
+            "POST /api/search/metadata",
+            json!({"assets": {"items": [{"originalPath": "/mnt/media/Lightroom/2026/2026-11-18/DSC1.ARW", "id": "A1"}], "nextPage": null}})
+                .to_string(),
+        ),
+        ("POST /api/albums", json!({"id": "NEW"}).to_string()),
+        ("PUT /api/albums/NEW/assets", "[]".into()),
+        ("GET /api/albums", "[]".into()),
+    ]);
+    let text = json!({"url": url, "paths": {"/mnt/media/Lightroom": nas.to_string_lossy()}}).to_string();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.set_immich(Some(lightcraft_engine::immich::Config::from_json(&text, Some("k".into()), None).unwrap()));
+    let app = LightcraftApp::new(session, crate::Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+    let jobs = dir.join("jobs.json");
+    h.app.immich.uploads_file = Some(jobs.clone());
+    let job = lightcraft_engine::immich_upload::Job::new(
+        vec![file.to_string_lossy().to_string()],
+        staging.to_string_lossy().to_string(),
+        lightcraft_engine::immich_upload::Target::New("Shoot".into()),
+    );
+    crate::immich_upload_ui::send(&mut h.app, job);
+    assert!(h.step_until(T, |h| !h.app.immich.uploading()), "the upload finishes");
+    assert_eq!(std::fs::read(nas.join("2026/2026-11-18/DSC1.ARW")).unwrap(), b"raw");
+    assert!(lightcraft_engine::immich_upload::load_jobs(&jobs).is_empty(), "nothing left pending");
+}

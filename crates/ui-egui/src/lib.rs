@@ -32,6 +32,8 @@ pub mod i18n;
 pub mod icons;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod immich_load;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod immich_upload_ui;
 pub mod lens_db;
 pub mod lightroom_import;
 pub mod links;

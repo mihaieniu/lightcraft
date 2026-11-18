@@ -220,6 +220,16 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(json!({}))
             }
         ),
+        cmd!(query "immich.uploadStatus", "Immich Uploads", [], None, "{} — imports waiting to be sent to an Immich album (immich-uploads.json) → {pending: [{files, target, copied, found, album}]}", always, |_, _| {
+            let jobs = crate::immich_upload::jobs_file().map(|f| crate::immich_upload::load_jobs(&f)).unwrap_or_default();
+            Ok(json!({"pending": jobs.iter().filter(|j| !j.done()).map(|j| json!({
+                "files": j.files.len(),
+                "target": j.target,
+                "copied": j.copied.iter().filter(|c| **c).count(),
+                "found": j.assets.iter().filter(|a| a.is_some()).count(),
+                "album": j.album,
+            })).collect::<Vec<_>>()}))
+        }),
         cmd!(query "immich.folders", "Immich Folders", [], None, "{} — the Immich server's folders, as it sees them, split into the Lightroom libraries (immich.json lightroom_libraries) and the rest → {lightroom: [path], other: [path]}", always, folders),
         cmd!(
             "immich.browseFolder",

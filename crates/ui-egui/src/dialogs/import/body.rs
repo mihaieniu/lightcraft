@@ -408,6 +408,8 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             }
         });
     });
+    #[cfg(not(target_arch = "wasm32"))]
+    immich_field(app, ui, d);
     field(ui, "Preset", |ui| {
         let cur = app
             .session
@@ -717,4 +719,69 @@ fn field<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R
         add(ui)
     })
     .inner
+}
+
+/// Send to Immich (CRAFT-11): one of the Lightroom albums (newest first), a new one, or none. The photos are copied
+/// into `~/Pictures/LightCraft Imports` by date, then sent to the server's Lightroom library and added to the album.
+#[cfg(not(target_arch = "wasm32"))]
+fn immich_field(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
+    use lightcraft_engine::immich::{AlbumSort, Group, display_name, year_groups};
+    if app.session.immich.is_none() {
+        return;
+    }
+    let lightroom: Vec<(lightcraft_engine::immich::Album, Group)> = match &app.immich.albums {
+        Some(Ok(a)) => a.iter().filter(|(_, g)| *g == Group::Lightroom).cloned().collect(),
+        _ => Vec::new(),
+    };
+    let order: Vec<usize> = year_groups(&lightroom, AlbumSort::Date).into_iter().flat_map(|(_, ix)| ix).collect();
+    field(ui, "Send to Immich", |ui| {
+        ui.vertical(|ui| {
+            let shown = match &d.immich_album {
+                Some(id) => lightroom.iter().find(|(a, _)| a.id == *id).map_or_else(|| id.clone(), |(a, _)| display_name(&a.name).to_string()),
+                None if !d.new_immich_album.is_empty() => crate::i18n::tr("New album").to_string(),
+                None => crate::i18n::tr("Don't send").to_string(),
+            };
+            let combo = crate::widgets::combo_box("import-immich").selected_text(shown).height(300.0).show_ui(ui, |ui| {
+                let none = ui.selectable_label(d.immich_album.is_none() && d.new_immich_album.is_empty(), crate::i18n::tr("Don't send"));
+                register(ui, "importImmich:none", none.rect);
+                if none.clicked() {
+                    d.immich_album = None;
+                    d.new_immich_album.clear();
+                }
+                let new = ui.selectable_label(d.immich_album.is_none() && !d.new_immich_album.is_empty(), crate::i18n::tr("New album…"));
+                register(ui, "importImmich:new", new.rect);
+                if new.clicked() {
+                    d.immich_album = None;
+                    if d.new_immich_album.is_empty() {
+                        d.new_immich_album = crate::i18n::tr("New Shoot").into();
+                    }
+                }
+                ui.separator();
+                for i in order {
+                    let Some((a, _)) = lightroom.get(i) else { continue };
+                    let r = ui.selectable_label(d.immich_album.as_deref() == Some(a.id.as_str()), display_name(&a.name));
+                    register(ui, format!("importImmich:{}", a.id), r.rect);
+                    if r.clicked() {
+                        d.immich_album = Some(a.id.clone());
+                        d.new_immich_album.clear();
+                    }
+                }
+            });
+            crate::widgets::name_combo(&combo.response, crate::i18n::tr("Send to Immich"));
+            if d.immich_album.is_none() && !d.new_immich_album.is_empty() {
+                let r = ui.add(egui::TextEdit::singleline(&mut d.new_immich_album).desired_width(f32::INFINITY));
+                register(ui, "field:importImmichName", r.rect);
+            }
+            if d.immich_album.is_some() || !d.new_immich_album.is_empty() {
+                let t = Tokens::get(ui.ctx());
+                ui.label(
+                    egui::RichText::new(crate::i18n::tr(
+                        "Copied to Pictures/LightCraft Imports by date, then sent to the server's Lightroom library and added to the album.",
+                    ))
+                    .color(t.text_dim)
+                    .small(),
+                );
+            }
+        });
+    });
 }
