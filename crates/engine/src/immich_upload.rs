@@ -135,7 +135,7 @@ pub fn run(
     let lib = client
         .libraries()?
         .into_iter()
-        .find(|l| cfg.lightroom_libraries.iter().any(|n| *n == l.name))
+        .find(|l| cfg.lightroom_libraries.contains(&l.name))
         .ok_or("Immich has no Lightroom library (immich.json lightroom_libraries)")?;
     let server_root = lib.import_paths.first().cloned().ok_or("the Lightroom library has no folder")?;
     let local_root = cfg.to_local(&server_root).ok_or_else(|| format!("{server_root} is not mapped to a folder here (immich.json paths)"))?;
