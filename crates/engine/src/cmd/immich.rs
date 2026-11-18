@@ -59,6 +59,9 @@ fn show_files(s: &mut Session, id: &str, name: &str, found: crate::immich::Album
     s.note_browsed(&root, &found.files);
     s.show_immich_album(id, name, root);
     s.add_to_immich_view(&found.files);
+    // shown now: their smart previews' 30 days start again
+    let shown = s.visible().to_vec();
+    crate::immich_retention::touch(s, &shown);
     Ok(json!({
         "id": id,
         "photos": s.visible().len(),
@@ -68,6 +71,94 @@ fn show_files(s: &mut Session, id: &str, name: &str, found: crate::immich::Album
         "missing": found.missing,
         "skipped": found.skipped,
     }))
+}
+
+/// The pin `p` names (`folder` as Immich sees it, or `album` id).
+fn pin_param(c: &str, p: &Value) -> Result<crate::immich_retention::Pin> {
+    use crate::immich_retention::Pin;
+    match (str_param(p, "folder").filter(|f| !f.is_empty()), str_param(p, "album").filter(|a| !a.is_empty())) {
+        (Some(f), None) => Ok(Pin::Folder(f.to_string())),
+        (None, Some(a)) => Ok(Pin::Album { id: a.to_string(), paths: Vec::new() }),
+        _ => Err(bad(c, "give `folder` or `album`")),
+    }
+}
+
+/// Every photo a pin keeps: a folder and the folders inside it, or an album. Network: a worker thread's job.
+pub fn pin_files(
+    cfg: &crate::immich::Config,
+    pin: &crate::immich_retention::Pin,
+    cancel: &AtomicBool,
+) -> std::result::Result<crate::immich::AlbumFiles, String> {
+    use crate::immich_retention::Pin;
+    match pin {
+        Pin::Album { id, .. } => crate::immich::album_files(cfg, id, cancel),
+        Pin::Folder(root) => {
+            let client = crate::immich::Client::new(cfg, cancel);
+            let mut out = crate::immich::AlbumFiles::default();
+            for f in client.folders()?.into_iter().filter(|f| crate::immich::is_under(f, root)) {
+                let found = crate::immich::folder_files(cfg, &f, cancel)?;
+                out.files.extend(found.files);
+                out.assets.extend(found.assets);
+                out.unmapped += found.unmapped;
+                out.missing += found.missing;
+                out.skipped += found.skipped;
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Import `found` in place without showing it (the preview server describing it when there is one).
+pub fn fetch_files(s: &mut Session, found: &crate::immich::AlbumFiles) -> Result<usize> {
+    let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
+    s.register_immich_assets(&found.assets);
+    import_with(s, &found.files, &opts)?;
+    s.build_queued_immich_previews();
+    Ok(found.files.len())
+}
+
+fn pin(s: &mut Session, p: &Value) -> Result<Value> {
+    use crate::immich_retention::Pin;
+    const C: &str = "immich.pin";
+    let cfg = config(s, C)?.clone();
+    let mut pin = pin_param(C, p)?;
+    let fetch = p.get("fetch").and_then(Value::as_bool).unwrap_or(true);
+    let found =
+        if fetch || matches!(pin, Pin::Album { .. }) { Some(pin_files(&cfg, &pin, &AtomicBool::new(false)).map_err(|e| bad(C, e))?) } else { None };
+    if let (Pin::Album { paths, .. }, Some(f)) = (&mut pin, &found) {
+        paths.clone_from(&f.files);
+    }
+    crate::immich_retention::add_pin(s, pin);
+    let photos = match (&found, fetch) {
+        (Some(f), true) => fetch_files(s, f)?,
+        (Some(f), false) => f.files.len(),
+        _ => 0,
+    };
+    Ok(json!({"pinned": true, "photos": photos}))
+}
+
+fn unpin(s: &mut Session, p: &Value) -> Result<Value> {
+    let pin = pin_param("immich.unpin", p)?;
+    crate::immich_retention::remove_pin(s, &pin);
+    Ok(json!({"pinned": false}))
+}
+
+fn cache_stats(s: &mut Session, _: &Value) -> Result<Value> {
+    let ((kc, kb), (tc, tb)) = crate::immich_retention::stats(s);
+    Ok(json!({
+        "kept": {"count": kc, "bytes": kb},
+        "temporary": {"count": tc, "bytes": tb},
+        "keepDays": crate::immich_retention::keep_days(s),
+        "pins": crate::immich_retention::pins(s),
+        "pcUnavailable": s.immich_previews.as_ref().is_some_and(|(rp, _)| rp.fallback_active()),
+    }))
+}
+
+fn ids_param(s: &Session, p: &Value) -> Vec<lightcraft_catalog::PhotoId> {
+    p.get("ids")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).map(lightcraft_catalog::PhotoId).filter(|id| s.catalog.photo(*id).is_some()).collect())
+        .unwrap_or_default()
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -81,6 +172,73 @@ pub fn specs() -> Vec<CommandSpec> {
             "{id, name?} — show an Immich album's photos from the mounted storage without adding them to the library (read in place; edits go to XMP sidecars) → {id, photos, new, failed, unmapped, missing, skipped}",
             always,
             browse_album
+        ),
+        cmd!(
+            "immich.pin",
+            "Keep Offline",
+            [],
+            None,
+            "{folder? (as Immich sees it) | album?, fetch?: bool = true} — keep a folder (and the folders in it) or an album's smart previews for good; with fetch, import its photos now (the preview server builds their smart previews) → {pinned, photos}",
+            always,
+            pin
+        ),
+        cmd!(
+            "immich.unpin",
+            "Don't Keep Offline",
+            [],
+            None,
+            "{folder? | album?} — stop keeping a folder's or album's smart previews for good (they then expire like the others) → {pinned: false}",
+            always,
+            unpin
+        ),
+        cmd!(query "immich.cacheStats", "Immich Offline Cache", [], None, "{} — the Immich photos' smart previews kept for good and kept for now, the keep days, the pins, and whether the preview server is unavailable → {kept: {count, bytes}, temporary: {count, bytes}, keepDays, pins, pcUnavailable}", always, cache_stats),
+        cmd!(
+            "immich.clearTemporary",
+            "Clear Temporary Immich Previews",
+            [],
+            None,
+            "{} — delete the smart previews of every Immich photo no pin keeps → {removed, bytes}",
+            always,
+            |s, _| Ok(json!(crate::immich_retention::clear_temporary(s)))
+        ),
+        cmd!(
+            "immich.expire",
+            "Expire Immich Previews",
+            [],
+            None,
+            "{} — delete the smart previews of Immich photos no pin keeps that were not shown for the keep days → {removed, bytes}",
+            always,
+            |s, _| Ok(json!(crate::immich_retention::expire(s, crate::immich_retention::now())))
+        ),
+        cmd!(
+            "immich.keepDays",
+            "Keep Immich Previews For",
+            [],
+            None,
+            "{days} — days an Immich photo not shown keeps its smart preview (0: for good; default 30) → {keepDays}",
+            always,
+            |s, p| {
+                let days = p
+                    .get("days")
+                    .and_then(Value::as_u64)
+                    .and_then(|d| u32::try_from(d).ok())
+                    .ok_or_else(|| bad("immich.keepDays", "give `days` (0 or more)"))?;
+                crate::immich_retention::set_keep_days(s, days);
+                Ok(json!({"keepDays": days}))
+            }
+        ),
+        cmd!(
+            "immich.touch",
+            "Immich Photos Shown",
+            [],
+            None,
+            "{ids} — these Immich photos were shown now: their smart previews' keep days start again → {}",
+            always,
+            |s, p| {
+                let ids = ids_param(s, p);
+                crate::immich_retention::touch(s, &ids);
+                Ok(json!({}))
+            }
         ),
         cmd!(query "immich.folders", "Immich Folders", [], None, "{} — the Immich server's folders, as it sees them, split into the Lightroom libraries (immich.json lightroom_libraries) and the rest → {lightroom: [path], other: [path]}", always, folders),
         cmd!(

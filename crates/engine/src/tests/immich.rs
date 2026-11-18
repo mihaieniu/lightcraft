@@ -552,7 +552,7 @@ fn folder_session(tag: &str) -> (crate::Session, PathBuf) {
         (
             "GET /api/view/folder/unique-paths",
             200,
-            json!(["/mnt/media/Lightroom/2024", "/mnt/media/GooglePhotos/Trip", "/usr/src/app/upload/x"]).to_string(),
+            json!(["/mnt/media/Lightroom/2024", "/mnt/media/GooglePhotos/Trip", "/srv/lib/sub", "/usr/src/app/upload/x"]).to_string(),
         ),
         ("GET /api/view/folder", 200, json!([{"originalPath": "/srv/lib/sub/c.png", "id": "c", "type": "IMAGE"}]).to_string()),
     ]);
@@ -566,7 +566,7 @@ fn folders_split_by_lightroom_library() {
     let (mut s, _d) = folder_session("folders");
     let r = s.execute("immich.folders", &json!({})).unwrap();
     assert_eq!(r["lightroom"], json!(["/mnt/media/Lightroom/2024"]), "{r}");
-    assert_eq!(r["other"], json!(["/mnt/media/GooglePhotos/Trip", "/usr/src/app/upload/x"]), "{r}");
+    assert_eq!(r["other"], json!(["/mnt/media/GooglePhotos/Trip", "/srv/lib/sub", "/usr/src/app/upload/x"]), "{r}");
 }
 
 #[test]
@@ -604,4 +604,84 @@ fn albums_carry_their_group() {
     s.set_immich(Some(config(&url, &[])));
     let r = s.execute("immich.albums", &json!({})).unwrap();
     assert_eq!(r["albums"][0]["group"], "lightroom", "{r}");
+}
+
+// ---- keep offline and the 30-day expiry (CRAFT-9) ----
+
+const DAY: i64 = 86_400;
+
+/// The worker album (a, b, c, each with a smart preview from the worker), all last shown at `shown`.
+fn kept_session(tag: &str, shown: i64) -> (crate::Session, Vec<lightcraft_catalog::PhotoId>, PathBuf) {
+    let (addr, _) = worker(usize::MAX);
+    let (mut s, _, d) = worker_session(tag, Some(&addr));
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    let mut ids = s.visible().to_vec();
+    ids.sort_by_key(|id| s.catalog.photo(*id).unwrap().file_name.clone());
+    crate::immich_retention::touch_at(&mut s, &ids, shown);
+    assert_eq!(smart_count(&mut s), 3);
+    (s, ids, d)
+}
+
+fn with_proxy(s: &mut crate::Session, ids: &[lightcraft_catalog::PhotoId]) -> Vec<bool> {
+    ids.iter().map(|id| crate::cmd::previews::has_smart_preview(s, *id)).collect()
+}
+
+#[test]
+fn unshown_31_days_is_expired_30_is_kept() {
+    let now = 1_800_000_000;
+    let (mut s, ids, _d) = kept_session("expire-31", now - 31 * DAY);
+    crate::immich_retention::touch_at(&mut s, &ids[..1], now - 30 * DAY);
+    let e = crate::immich_retention::expire(&mut s, now);
+    assert_eq!(e.removed, 2);
+    assert!(e.bytes > 0);
+    assert_eq!(with_proxy(&mut s, &ids), vec![true, false, false]);
+}
+
+#[test]
+fn photo_in_any_pin_survives_expiry() {
+    let now = 1_800_000_000;
+    let (mut s, ids, d) = kept_session("expire-pins", now - 90 * DAY);
+    // a folder pin covers a.png (as Immich sees it); an album pin covers b.png
+    crate::immich_retention::add_pin(&mut s, crate::immich_retention::Pin::Folder("/srv/lib/a.png".into()));
+    let b = d.join("b.png").to_string_lossy().to_string();
+    crate::immich_retention::add_pin(&mut s, crate::immich_retention::Pin::Album { id: "x".into(), paths: vec![b] });
+    assert_eq!(crate::immich_retention::expire(&mut s, now).removed, 1);
+    assert_eq!(with_proxy(&mut s, &ids), vec![true, true, false]);
+}
+
+#[test]
+fn keep_days_zero_never_expires() {
+    let now = 1_800_000_000;
+    let (mut s, ids, _d) = kept_session("expire-never", now - 900 * DAY);
+    crate::immich_retention::set_keep_days(&mut s, 0);
+    assert_eq!(crate::immich_retention::expire(&mut s, now).removed, 0);
+    assert_eq!(with_proxy(&mut s, &ids), vec![true, true, true]);
+}
+
+#[test]
+fn clear_temporary_keeps_pins() {
+    let (mut s, ids, _d) = kept_session("clear-temp", 1_800_000_000);
+    s.execute("immich.pin", &json!({"folder": "/srv/lib/c.png", "fetch": false})).unwrap();
+    let st = s.execute("immich.cacheStats", &json!({})).unwrap();
+    assert_eq!((st["kept"]["count"].as_u64(), st["temporary"]["count"].as_u64()), (Some(1), Some(2)), "{st}");
+    let r = s.execute("immich.clearTemporary", &json!({})).unwrap();
+    assert_eq!(r["removed"], 2, "{r}");
+    assert_eq!(with_proxy(&mut s, &ids), vec![false, false, true]);
+}
+
+#[test]
+fn pin_fetches_whole_folder() {
+    let (addr, _) = worker(usize::MAX);
+    let (mut s, d) = folder_session("pin-fetch");
+    s.open_library(d.join("library"), false).unwrap();
+    let mut cfg = s.immich.clone().unwrap();
+    cfg.worker = Some(crate::immich::WorkerConfig { addr, token: "a-long-shared-token-123".into() });
+    s.set_immich(Some(cfg));
+    // the fake lists sub/c.png for any folder asked about; /srv/lib holds /srv/lib/sub
+    let r = s.execute("immich.pin", &json!({"folder": "/srv/lib"})).unwrap();
+    assert_eq!(r["photos"], 1, "{r}");
+    let c = s.catalog.photos().find(|p| p.file_name == "c.png").map(|p| p.id).expect("c.png fetched");
+    assert!(crate::cmd::previews::has_smart_preview(&s, c));
+    let st = s.execute("immich.cacheStats", &json!({})).unwrap();
+    assert_eq!(st["kept"]["count"], 1, "{st}");
 }

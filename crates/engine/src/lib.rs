@@ -49,6 +49,8 @@ pub mod guard;
 pub mod immich;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod immich_previews;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod immich_retention;
 pub mod import;
 mod import_move;
 pub mod lens_profiles;
