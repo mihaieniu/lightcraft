@@ -845,3 +845,55 @@ fn parse_albums_reads_start_date() {
     assert_eq!(a[0].start.as_deref(), Some("2026-06-20T00:00:00.000Z"));
     assert_eq!(a[1].start, None);
 }
+
+// ---- album covers (CRAFT-11) ----
+
+fn one(id: &str) -> String {
+    json!({"assets": {"items": [{"originalPath": "/x.jpg", "id": id}], "nextPage": null}}).to_string()
+}
+
+#[test]
+fn cover_prefers_favourite_then_five_stars_then_first() {
+    let none = json!({"assets": {"items": [], "nextPage": null}}).to_string();
+    let (url, _) = fake_immich(vec![
+        ("POST /api/search/metadata|isFavorite", 200, one("fav")),
+        ("POST /api/search/metadata|rating", 200, one("five")),
+        ("POST /api/search/metadata", 200, one("first")),
+    ]);
+    let c = config(&url, &[]);
+    let cancel = AtomicBool::new(false);
+    assert_eq!(Client::new(&c, &cancel).album_cover("a").unwrap().as_deref(), Some("fav"));
+    let (url, _) = fake_immich(vec![
+        ("POST /api/search/metadata|isFavorite", 200, none.clone()),
+        ("POST /api/search/metadata|rating", 200, one("five")),
+        ("POST /api/search/metadata", 200, one("first")),
+    ]);
+    let c = config(&url, &[]);
+    assert_eq!(Client::new(&c, &cancel).album_cover("a").unwrap().as_deref(), Some("five"));
+    let (url, _) = fake_immich(vec![
+        ("POST /api/search/metadata|isFavorite", 200, none.clone()),
+        ("POST /api/search/metadata|rating", 200, none.clone()),
+        ("POST /api/search/metadata", 200, one("first")),
+    ]);
+    let c = config(&url, &[]);
+    assert_eq!(Client::new(&c, &cancel).album_cover("a").unwrap().as_deref(), Some("first"));
+    let (url, _) = fake_immich(vec![("POST /api/search/metadata", 200, none)]);
+    let c = config(&url, &[]);
+    assert_eq!(Client::new(&c, &cancel).album_cover("a").unwrap(), None, "an empty album has no cover");
+}
+
+#[test]
+fn cover_bytes_are_capped() {
+    let d = temp_dir("covers");
+    let (url, _) = fake_immich(vec![
+        ("GET /api/assets/small/thumbnail", 200, "RIFFxxxxWEBP".to_string()),
+        ("GET /api/assets/huge/thumbnail", 200, "x".repeat(crate::immich::MAX_COVER + 1)),
+    ]);
+    let c = config(&url, &[]);
+    let cancel = AtomicBool::new(false);
+    let f = crate::immich::cached_cover(&c, "small", &d, &cancel).unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"RIFFxxxxWEBP");
+    assert!(crate::immich::cached_cover(&c, "huge", &d, &cancel).is_err());
+    assert!(!d.join("huge.webp").exists(), "nothing written for a refused cover");
+    assert!(crate::immich::cached_cover(&c, "../x", &d, &cancel).is_err(), "never a path");
+}

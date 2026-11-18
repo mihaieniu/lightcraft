@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Assets asked for per search page.
 const PAGE_SIZE: u32 = 1000;
+/// Largest album cover thumbnail read (Immich's are about 10–50 KB).
+pub const MAX_COVER: usize = 512 * 1024;
 /// Smart previews fetched from the preview server at once.
 const FETCH_THREADS: usize = 8;
 /// Photos looked at to place an album in a [`Group`].
@@ -440,6 +442,46 @@ impl<'a> Client<'a> {
             .collect())
     }
 
+    /// The first asset of album `id` matching `filter` (search params), if any.
+    fn first_in_album(&self, id: &str, filter: Value) -> Result<Option<String>, String> {
+        let mut body = json!({"albumIds": [id], "type": "IMAGE", "size": 1, "page": 1, "withExif": false});
+        if let (Some(b), Value::Object(f)) = (body.as_object_mut(), filter) {
+            b.extend(f);
+        }
+        let (assets, _) = parse_page(&self.json("POST", "/api/search/metadata", Some(&body))?)?;
+        Ok(assets.into_iter().map(|(_, id)| id).find(|i| !i.is_empty()))
+    }
+
+    /// Album `id`'s cover: its first favourite photo, else its first 5★ one, else its first one (`None`: empty).
+    pub fn album_cover(&self, id: &str) -> Result<Option<String>, String> {
+        check_id(id)?;
+        for filter in [json!({"isFavorite": true}), json!({"rating": 5}), json!({})] {
+            if let Some(a) = self.first_in_album(id, filter)? {
+                return Ok(Some(a));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Asset `asset`'s small thumbnail as Immich stores it (WebP), at most [`MAX_COVER`] bytes.
+    pub fn thumbnail(&self, asset: &str) -> Result<Vec<u8>, String> {
+        check_id(asset)?;
+        let mut r = self.send("GET", &format!("/api/assets/{asset}/thumbnail?size=thumbnail"), None)?;
+        let limits = self.limits();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = r.read(&mut buf, &limits).map_err(|e| format!("Immich: {e}"))?;
+            if n == 0 {
+                return Ok(out);
+            }
+            if out.len().saturating_add(n) > MAX_COVER {
+                return Err(format!("asset {asset}'s thumbnail is larger than {} KB", MAX_COVER / 1024));
+            }
+            out.extend_from_slice(buf.get(..n).unwrap_or_default());
+        }
+    }
+
     /// The external libraries.
     pub fn libraries(&self) -> Result<Vec<Library>, String> {
         parse_libraries(&self.json("GET", "/api/libraries", None)?)
@@ -519,6 +561,24 @@ pub struct AlbumFiles {
 /// Most pages read for one album (1,000 photos each).
 const MAX_PAGES: u32 = 1000;
 
+/// Where album covers are kept on this computer.
+pub fn covers_dir() -> Option<PathBuf> {
+    crate::config::config_dir().map(|d| d.join("immich-covers"))
+}
+
+/// Asset `asset`'s cover thumbnail file in `dir`: read from there, else fetched from the server and kept.
+pub fn cached_cover(cfg: &Config, asset: &str, dir: &Path, cancel: &AtomicBool) -> Result<PathBuf, String> {
+    check_id(asset)?;
+    let f = dir.join(format!("{asset}.webp"));
+    if f.is_file() {
+        return Ok(f);
+    }
+    let bytes = Client::new(cfg, cancel).thumbnail(asset)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    lightcraft_catalog::safe_file::write_atomic(&f, &bytes).map_err(|e| format!("{}: {e}", f.display()))?;
+    Ok(f)
+}
+
 /// Immich's folders by group (as Immich sees them, sorted).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Folders {
@@ -533,8 +593,9 @@ pub fn albums_with_groups(cfg: &Config, cancel: &AtomicBool) -> Result<Vec<(Albu
     let libraries = client.libraries().unwrap_or_default();
     Ok(albums
         .into_iter()
-        .map(|a| {
+        .map(|mut a| {
             let g = client.album_group(&a.id, &libraries).unwrap_or(Group::Other);
+            a.cover = client.album_cover(&a.id).ok().flatten();
             (a, g)
         })
         .collect())
