@@ -53,6 +53,7 @@ fn show_files(s: &mut Session, id: &str, name: &str, found: crate::immich::Album
     let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
     s.register_immich_assets(&found.assets);
     let report = import_with(s, &found.files, &opts)?;
+    s.fetch_missing_immich_previews(&found.assets);
     s.build_queued_immich_previews();
     let root = crate::immich::common_root(&found.files);
     // the album's folders count as browsed: their untouched photos aren't forgotten while it is in use
@@ -88,6 +89,7 @@ pub fn fetch_files(s: &mut Session, found: &crate::immich::AlbumFiles) -> Result
     let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
     s.register_immich_assets(&found.assets);
     import_with(s, &found.files, &opts)?;
+    s.fetch_missing_immich_previews(&found.assets);
     s.build_queued_immich_previews();
     Ok(found.files.len())
 }

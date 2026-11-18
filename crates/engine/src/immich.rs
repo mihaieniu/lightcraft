@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Assets asked for per search page.
 const PAGE_SIZE: u32 = 1000;
+/// Smart previews fetched from the preview server at once.
+const FETCH_THREADS: usize = 8;
 /// Photos looked at to place an album in a [`Group`].
 pub const GROUP_SAMPLE: u32 = 100;
 
@@ -561,6 +563,52 @@ impl crate::Session {
     pub fn register_immich_assets(&self, assets: &[(String, String)]) {
         if let Some((rp, _)) = &self.immich_previews {
             rp.register(assets, self.media.smart_dir.clone());
+        }
+    }
+
+    /// Fetch from the preview server, in the background, the smart previews Immich photos `assets` (local path, asset
+    /// id) already in the catalog don't have (browsed before there was a server, or expired). Without a usable server
+    /// they are queued to be built here.
+    pub fn fetch_missing_immich_previews(&mut self, assets: &[(String, String)]) {
+        let (Some((rp, _)), Some(dir)) = (self.immich_previews.clone(), self.media.smart_dir.clone()) else { return };
+        let by_path: std::collections::HashMap<&str, &str> = assets.iter().map(|(p, a)| (p.as_str(), a.as_str())).collect();
+        let jobs: Vec<(String, String, PathBuf)> = self
+            .catalog
+            .photos()
+            .filter_map(|p| {
+                let lightcraft_catalog::Source::File { path } = &p.source else { return None };
+                let asset = by_path.get(path.as_str())?;
+                let to = crate::smart::sharded_file_path(&dir, p);
+                (!crate::smart::is_valid(&crate::smart::existing_file_path(&dir, to.clone()))).then(|| (path.clone(), (*asset).to_string(), to))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        if !rp.usable() {
+            rp.queue_paths(jobs.into_iter().map(|(p, _, _)| p));
+            return;
+        }
+        let total = jobs.len() as u64;
+        let guard = std::sync::Arc::new(self.activity.start("immich", "Fetching smart previews from the PC", crate::activity::Cancel::No));
+        guard.progress(0, total);
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // a few at once: the server decodes on many cores, and each answer is about a megabyte
+        for _ in 0..FETCH_THREADS {
+            let (rp, queue, done, guard) = (rp.clone(), queue.clone(), done.clone(), guard.clone());
+            let spawned = std::thread::Builder::new().name("immich-previews".into()).spawn(move || {
+                loop {
+                    let Some((path, asset, to)) = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop() else { break };
+                    if let Err(e) = rp.fetch_into(&asset, &to) {
+                        log::info!("smart preview of {path} from the PC: {e}");
+                    }
+                    guard.progress(done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1, total);
+                }
+            });
+            if let Err(e) = spawned {
+                log::warn!("smart previews from the PC: {e}");
+            }
         }
     }
 

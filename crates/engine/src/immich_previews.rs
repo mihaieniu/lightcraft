@@ -73,6 +73,25 @@ impl RemotePreviews {
         Some(built.probe)
     }
 
+    /// Asset `asset`'s smart preview from the server, written to `to` (the photo's own smart preview path).
+    pub fn fetch_into(&self, asset: &str, to: &std::path::Path) -> Result<(), String> {
+        let built = self.client.build(asset)?;
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        lightcraft_catalog::safe_file::write_atomic(to, &built.smart).map_err(|e| format!("{}: {e}", to.display()))
+    }
+
+    /// Whether the server is still worth asking.
+    pub fn usable(&self) -> bool {
+        self.client.usable()
+    }
+
+    /// Have these Immich photos' smart previews built here instead.
+    pub fn queue_paths(&self, paths: impl IntoIterator<Item = String>) {
+        self.local_queue.lock().unwrap_or_else(PoisonError::into_inner).extend(paths);
+    }
+
     fn queue_local(&self, path: &str) {
         if self.ids.lock().unwrap_or_else(PoisonError::into_inner).contains_key(path) {
             self.local_queue.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_string());

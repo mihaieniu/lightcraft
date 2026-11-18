@@ -272,7 +272,8 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 return;
             }
             Ok(Msg::Done) | Err(TryRecvError::Disconnected) => {
-                // what the preview server didn't do is built here
+                // photos here before the preview server get theirs now; what it didn't do is built here
+                app.session.fetch_missing_immich_previews(&task.found.assets);
                 app.session.build_queued_immich_previews();
                 // shown now: their smart previews' keep days start again
                 let shown = app.session.visible().to_vec();

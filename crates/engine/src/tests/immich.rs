@@ -685,3 +685,25 @@ fn pin_fetches_whole_folder() {
     let st = s.execute("immich.cacheStats", &json!({})).unwrap();
     assert_eq!(st["kept"]["count"], 1, "{st}");
 }
+
+#[test]
+fn photos_already_here_get_their_smart_previews_from_the_worker() {
+    // browsed once without a worker: in the catalog, no smart previews
+    let (mut s, _calls, _d) = worker_session("already-here", None);
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    assert_eq!(smart_count(&mut s), 0);
+    // the worker is set up: opening the album again fetches what is missing (in the background)
+    let (addr, built) = worker(usize::MAX);
+    let mut cfg = s.immich.clone().unwrap();
+    cfg.worker = Some(crate::immich::WorkerConfig { addr, token: "a-long-shared-token-123".into() });
+    s.set_immich(Some(cfg));
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    for _ in 0..500 {
+        if smart_count(&mut s) == 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(smart_count(&mut s), 3);
+    assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
