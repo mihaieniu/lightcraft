@@ -75,6 +75,9 @@ pub struct MediaCache {
     pub file_bytes: Option<crate::merge::ByteReader>,
     /// The library's smart previews folder (originals offline: render from the proxy).
     pub smart_dir: Option<std::path::PathBuf>,
+    /// Folders whose photos (Immich's, CRAFT-9) show their smart preview, when they have one, even while the original
+    /// is online: only a full-size view reads the original.
+    pub smart_first: Vec<String>,
     /// Whether originals (and smart previews) are on disk: cached and checked off the UI thread
     /// in the app (see [`crate::availability`]).
     pub availability: crate::availability::Availability,

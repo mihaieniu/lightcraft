@@ -258,7 +258,7 @@ fn immich_albums_lists_albums() {
     let mut s = crate::Session::new().with_fs();
     s.immich = Some(config(&url, &[]));
     let r = s.execute("immich.albums", &json!({})).unwrap();
-    assert_eq!(r["albums"][0], json!({"id": "a", "name": "Trip", "count": 2}));
+    assert_eq!(r["albums"][0], json!({"id": "a", "name": "Trip", "count": 2, "group": "other"}));
 }
 
 #[test]
@@ -510,4 +510,98 @@ fn no_worker_config_keeps_todays_path() {
     s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(smart_count(&mut s), 0, "no smart previews are made without a worker");
+}
+
+// ---- Immich photos preview from their smart preview; folders; Lightroom grouping (CRAFT-9) ----
+
+#[test]
+fn immich_photos_preview_from_smart_preview_when_online() {
+    let (mut s, _calls, _d) = worker_session("smart-first", None);
+    s.execute("immich.browseAlbum", &json!({"id": "a", "name": "Trip"})).unwrap();
+    let id = s.visible().to_vec()[0];
+    let p = (**s.catalog.photo(id).unwrap()).clone();
+    // a magenta proxy: the original (a dim gradient) is online, yet the preview shows the proxy
+    let mut img = lightcraft_raster::Rgb32f::new(16, 12);
+    img.data.iter_mut().for_each(|px| *px = [1.0, 0.0, 1.0]);
+    let sp = crate::smart::sharded_file_path(s.media.smart_dir.as_ref().unwrap(), &p);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    std::fs::write(&sp, crate::smart::encode(&img, None).unwrap()).unwrap();
+    s.media.forget(id);
+    let r = s.render_now(id, 16, 12).unwrap().image;
+    let n = r.data.len() as f64;
+    // (the original's red is a ramp averaging about 67; the proxy's is full)
+    let red = r.data.iter().map(|px| f64::from(px[0])).sum::<f64>() / n;
+    assert!(red > 150.0, "the smart preview is shown: mean red {red}");
+}
+
+fn folder_session(tag: &str) -> (crate::Session, PathBuf) {
+    let d = temp_dir(tag);
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    png(&d.join("sub/c.png"), 3);
+    png(&d.join("a.png"), 1);
+    let (url, _) = fake_immich(vec![
+        (
+            "GET /api/libraries",
+            200,
+            json!([
+                {"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]},
+                {"id": "L2", "name": "GooglePhotos", "importPaths": ["/mnt/media/GooglePhotos"]}
+            ])
+            .to_string(),
+        ),
+        (
+            "GET /api/view/folder/unique-paths",
+            200,
+            json!(["/mnt/media/Lightroom/2024", "/mnt/media/GooglePhotos/Trip", "/usr/src/app/upload/x"]).to_string(),
+        ),
+        ("GET /api/view/folder", 200, json!([{"originalPath": "/srv/lib/sub/c.png", "id": "c", "type": "IMAGE"}]).to_string()),
+    ]);
+    let mut s = crate::Session::new().with_fs();
+    s.set_immich(Some(config(&url, &[("/srv/lib", d.to_str().unwrap())])));
+    (s, d)
+}
+
+#[test]
+fn folders_split_by_lightroom_library() {
+    let (mut s, _d) = folder_session("folders");
+    let r = s.execute("immich.folders", &json!({})).unwrap();
+    assert_eq!(r["lightroom"], json!(["/mnt/media/Lightroom/2024"]), "{r}");
+    assert_eq!(r["other"], json!(["/mnt/media/GooglePhotos/Trip", "/usr/src/app/upload/x"]), "{r}");
+}
+
+#[test]
+fn album_group_by_majority() {
+    use crate::immich::{Group, Library, group_by_majority};
+    let c = config("http://h", &[]);
+    let libs = vec![
+        Library { id: "L1".into(), name: "Lightroom".into(), import_paths: vec!["/mnt/media/Lightroom".into()] },
+        Library { id: "L2".into(), name: "GooglePhotos".into(), import_paths: vec!["/mnt/media/GooglePhotos".into()] },
+    ];
+    let lr = ["/mnt/media/Lightroom/a.nef", "/mnt/media/Lightroom/b.nef", "/mnt/media/GooglePhotos/c.jpg"].map(String::from);
+    assert_eq!(group_by_majority(&c, &libs, &lr), Group::Lightroom);
+    let other = ["/mnt/media/Lightroom/a.nef", "/usr/src/app/upload/b.jpg", "/mnt/media/GooglePhotos/c.jpg"].map(String::from);
+    assert_eq!(group_by_majority(&c, &libs, &other), Group::Other);
+    assert_eq!(group_by_majority(&c, &libs, &[]), Group::Other);
+}
+
+#[test]
+fn browse_folder_shows_its_photos() {
+    let (mut s, _d) = folder_session("browse-folder");
+    let r = s.execute("immich.browseFolder", &json!({"path": "/srv/lib/sub"})).unwrap();
+    assert_eq!(r["photos"], 1, "{r}");
+    assert_eq!(s.source, crate::LibrarySource::Immich);
+    assert_eq!(visible_names(&mut s), vec!["c.png"]);
+}
+
+#[test]
+fn albums_carry_their_group() {
+    let (url, _) = fake_immich(vec![
+        ("GET /api/albums", 200, json!([{"id": "a", "albumName": "Wedding", "assetCount": 2}]).to_string()),
+        ("GET /api/libraries", 200, json!([{"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]}]).to_string()),
+        ("POST /api/search/metadata", 200, page(&["/mnt/media/Lightroom/a.nef", "/mnt/media/Lightroom/b.nef"], None)),
+    ]);
+    let mut s = crate::Session::new().with_fs();
+    s.set_immich(Some(config(&url, &[])));
+    let r = s.execute("immich.albums", &json!({})).unwrap();
+    assert_eq!(r["albums"][0]["group"], "lightroom", "{r}");
 }

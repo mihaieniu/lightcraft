@@ -18,8 +18,8 @@ fn config<'a>(s: &'a Session, c: &str) -> Result<&'a crate::immich::Config> {
 fn albums(s: &mut Session, _: &Value) -> Result<Value> {
     const C: &str = "immich.albums";
     let cfg = config(s, C)?;
-    let list = crate::immich::Client::new(cfg, &AtomicBool::new(false)).albums().map_err(|e| bad(C, e))?;
-    Ok(json!({"albums": list.iter().map(|a| json!({"id": a.id, "name": a.name, "count": a.count})).collect::<Vec<_>>()}))
+    let list = crate::immich::albums_with_groups(cfg, &AtomicBool::new(false)).map_err(|e| bad(C, e))?;
+    Ok(json!({"albums": list.iter().map(|(a, g)| json!({"id": a.id, "name": a.name, "count": a.count, "group": g})).collect::<Vec<_>>()}))
 }
 
 fn browse_album(s: &mut Session, p: &Value) -> Result<Value> {
@@ -28,6 +28,27 @@ fn browse_album(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_param(p, "id").filter(|i| !i.is_empty()).ok_or_else(|| bad(C, "missing `id`"))?;
     let name = str_param(p, "name").unwrap_or("Immich Album");
     let found = crate::immich::album_files(&cfg, id, &AtomicBool::new(false)).map_err(|e| bad(C, e))?;
+    show_files(s, id, name, found)
+}
+
+fn folders(s: &mut Session, _: &Value) -> Result<Value> {
+    const C: &str = "immich.folders";
+    let cfg = config(s, C)?;
+    let f = crate::immich::folder_tree(cfg, &AtomicBool::new(false)).map_err(|e| bad(C, e))?;
+    Ok(json!(f))
+}
+
+fn browse_folder(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "immich.browseFolder";
+    let cfg = config(s, C)?.clone();
+    let path = str_param(p, "path").filter(|i| !i.is_empty()).ok_or_else(|| bad(C, "missing `path`"))?;
+    let name = str_param(p, "name").map(str::to_string).unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+    let found = crate::immich::folder_files(&cfg, path, &AtomicBool::new(false)).map_err(|e| bad(C, e))?;
+    show_files(s, &format!("folder:{path}"), &name, found)
+}
+
+/// Show Immich's photos `found` as view `id`, imported in place (the preview server describing them when there is one).
+fn show_files(s: &mut Session, id: &str, name: &str, found: crate::immich::AlbumFiles) -> Result<Value> {
     // like library.browse: read in place, never bringing deleted photos back
     let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
     s.register_immich_assets(&found.assets);
@@ -51,7 +72,7 @@ fn browse_album(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!(query "immich.albums", "Immich Albums", [], None, "{} — the Immich server's albums (needs lightcraft/immich.json) → {albums: [{id, name, count}]}", always, albums),
+        cmd!(query "immich.albums", "Immich Albums", [], None, "{} — the Immich server's albums (needs lightcraft/immich.json), each in the group most of its photos are in → {albums: [{id, name, count, group: lightroom|other}]}", always, albums),
         cmd!(
             "immich.browseAlbum",
             "Show Immich Album",
@@ -60,6 +81,16 @@ pub fn specs() -> Vec<CommandSpec> {
             "{id, name?} — show an Immich album's photos from the mounted storage without adding them to the library (read in place; edits go to XMP sidecars) → {id, photos, new, failed, unmapped, missing, skipped}",
             always,
             browse_album
+        ),
+        cmd!(query "immich.folders", "Immich Folders", [], None, "{} — the Immich server's folders, as it sees them, split into the Lightroom libraries (immich.json lightroom_libraries) and the rest → {lightroom: [path], other: [path]}", always, folders),
+        cmd!(
+            "immich.browseFolder",
+            "Show Immich Folder",
+            [],
+            None,
+            "{path, name?} — show the photos directly in an Immich folder (path as Immich sees it) from the mounted storage, as immich.browseAlbum does → {id, photos, new, failed, unmapped, missing, skipped}",
+            always,
+            browse_folder
         ),
     ]
 }

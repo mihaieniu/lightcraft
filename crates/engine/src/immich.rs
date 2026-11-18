@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Assets asked for per search page.
 const PAGE_SIZE: u32 = 1000;
+/// Photos looked at to place an album in a [`Group`].
+pub const GROUP_SAMPLE: u32 = 100;
 
 /// Where Immich is and how its folders appear here.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +60,33 @@ pub struct Album {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Library {
     pub id: String,
+    pub name: String,
     pub import_paths: Vec<String>,
+}
+
+/// Which part of My Photos an Immich folder or album shows under (CRAFT-9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Group {
+    /// In a library [`Config::lightroom_libraries`] names.
+    Lightroom,
+    /// Every other library, and the phone uploads.
+    Other,
+}
+
+/// The group of a path as Immich sees it.
+pub fn group_of(cfg: &Config, libraries: &[Library], server_path: &str) -> Group {
+    let lightroom = libraries
+        .iter()
+        .filter(|l| cfg.lightroom_libraries.iter().any(|n| n == &l.name))
+        .any(|l| l.import_paths.iter().any(|p| under(server_path, p).is_some()));
+    if lightroom { Group::Lightroom } else { Group::Other }
+}
+
+/// The group most of `paths` are in (`Other` on a tie or when there are none).
+pub fn group_by_majority(cfg: &Config, libraries: &[Library], paths: &[String]) -> Group {
+    let lr = paths.iter().filter(|p| group_of(cfg, libraries, p) == Group::Lightroom).count();
+    if lr * 2 > paths.len() { Group::Lightroom } else { Group::Other }
 }
 
 fn trim_dir(s: &str) -> String {
@@ -72,6 +100,16 @@ fn expand_home(s: &str, home: Option<&Path>) -> Result<String, String> {
         (Some(_), None) => Err(format!("{s}: no home folder to expand `~` with")),
         _ => Ok(s.to_string()),
     }
+}
+
+/// Whether `path` is folder `dir` or inside it (whole names only).
+pub fn is_under(path: &str, dir: &str) -> bool {
+    under(path, dir).is_some()
+}
+
+/// `s` for a URL query value: everything but unreserved characters percent-encoded.
+fn query_value(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// `path` inside folder `dir`, or `dir` itself, by whole names: what follows `dir` in it.
@@ -210,7 +248,7 @@ pub(crate) fn parse_libraries(v: &Value) -> Result<Vec<Library>, String> {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(trim_dir).collect())
                 .unwrap_or_default();
-            Ok(Library { id: str_field(l, "id")?, import_paths })
+            Ok(Library { id: str_field(l, "id")?, name: l.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), import_paths })
         })
         .collect()
 }
@@ -304,6 +342,32 @@ impl<'a> Client<'a> {
         parse_page(&self.json("POST", "/api/search/metadata", Some(&body))?)
     }
 
+    /// The group most of album `id`'s first [`GROUP_SAMPLE`] photos are in.
+    pub fn album_group(&self, id: &str, libraries: &[Library]) -> Result<Group, String> {
+        let body = json!({"albumIds": [id], "type": "IMAGE", "size": GROUP_SAMPLE, "page": 1, "withExif": false});
+        let (assets, _) = parse_page(&self.json("POST", "/api/search/metadata", Some(&body))?)?;
+        let paths: Vec<String> = assets.into_iter().map(|(p, _)| p).collect();
+        Ok(group_by_majority(self.cfg, libraries, &paths))
+    }
+
+    /// Every folder holding assets, as Immich sees it.
+    pub fn folders(&self) -> Result<Vec<String>, String> {
+        let v = self.json("GET", "/api/view/folder/unique-paths", None)?;
+        let list = v.as_array().ok_or("Immich sent no folder list")?;
+        Ok(list.iter().filter_map(Value::as_str).map(trim_dir).collect())
+    }
+
+    /// The assets directly in folder `path` (as Immich sees it): (`originalPath`, id).
+    pub fn folder_assets(&self, path: &str) -> Result<Vec<(String, String)>, String> {
+        let v = self.json("GET", &format!("/api/view/folder?path={}", query_value(path)), None)?;
+        let list = v.as_array().ok_or("Immich sent no folder contents")?;
+        Ok(list
+            .iter()
+            .filter(|a| a.get("type").and_then(Value::as_str).is_none_or(|t| t == "IMAGE"))
+            .filter_map(|a| Some((a.get("originalPath")?.as_str()?.to_string(), a.get("id").and_then(Value::as_str).unwrap_or_default().to_string())))
+            .collect())
+    }
+
     /// The external libraries.
     pub fn libraries(&self) -> Result<Vec<Library>, String> {
         parse_libraries(&self.json("GET", "/api/libraries", None)?)
@@ -383,6 +447,67 @@ pub struct AlbumFiles {
 /// Most pages read for one album (1,000 photos each).
 const MAX_PAGES: u32 = 1000;
 
+/// Immich's folders by group (as Immich sees them, sorted).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Folders {
+    pub lightroom: Vec<String>,
+    pub other: Vec<String>,
+}
+
+/// The albums, each with its [`Group`] (Other when it can't be told). Network: a worker thread's job.
+pub fn albums_with_groups(cfg: &Config, cancel: &AtomicBool) -> Result<Vec<(Album, Group)>, String> {
+    let client = Client::new(cfg, cancel);
+    let albums = client.albums()?;
+    let libraries = client.libraries().unwrap_or_default();
+    Ok(albums
+        .into_iter()
+        .map(|a| {
+            let g = client.album_group(&a.id, &libraries).unwrap_or(Group::Other);
+            (a, g)
+        })
+        .collect())
+}
+
+/// Every folder of the server, split into [`Group`]s (network, so a worker thread's job).
+pub fn folder_tree(cfg: &Config, cancel: &AtomicBool) -> Result<Folders, String> {
+    let client = Client::new(cfg, cancel);
+    let libraries = client.libraries()?;
+    let mut out = Folders::default();
+    for f in client.folders()? {
+        match group_of(cfg, &libraries, &f) {
+            Group::Lightroom => out.lightroom.push(f),
+            Group::Other => out.other.push(f),
+        }
+    }
+    out.lightroom.sort();
+    out.other.sort();
+    Ok(out)
+}
+
+/// Add Immich's (path, id)s to `out`, mapped here.
+fn sort_assets(cfg: &Config, assets: Vec<(String, String)>, out: &mut AlbumFiles) {
+    for (p, asset) in assets {
+        match cfg.to_local(&p) {
+            None => out.unmapped += 1,
+            Some(l) if !Path::new(&l).is_file() => out.missing += 1,
+            Some(l) if !crate::import::is_supported(Path::new(&l)) => out.skipped += 1,
+            Some(l) => {
+                if !asset.is_empty() {
+                    out.assets.push((l.clone(), asset));
+                }
+                out.files.push(l)
+            }
+        }
+    }
+}
+
+/// The photos directly in folder `path` (as Immich sees it), mapped here.
+pub fn folder_files(cfg: &Config, path: &str, cancel: &AtomicBool) -> Result<AlbumFiles, String> {
+    let mut out = AlbumFiles::default();
+    sort_assets(cfg, Client::new(cfg, cancel).folder_assets(path)?, &mut out);
+    Ok(out)
+}
+
 /// Every photo of album `id`, mapped to this computer (all pages; network and disk, so a worker thread's job).
 pub fn album_files(cfg: &Config, id: &str, cancel: &AtomicBool) -> Result<AlbumFiles, String> {
     let client = Client::new(cfg, cancel);
@@ -390,19 +515,7 @@ pub fn album_files(cfg: &Config, id: &str, cancel: &AtomicBool) -> Result<AlbumF
     let mut page = 1;
     for _ in 0..MAX_PAGES {
         let (assets, next) = client.album_page_assets(id, page)?;
-        for (p, asset) in assets {
-            match cfg.to_local(&p) {
-                None => out.unmapped += 1,
-                Some(l) if !Path::new(&l).is_file() => out.missing += 1,
-                Some(l) if !crate::import::is_supported(Path::new(&l)) => out.skipped += 1,
-                Some(l) => {
-                    if !asset.is_empty() {
-                        out.assets.push((l.clone(), asset));
-                    }
-                    out.files.push(l)
-                }
-            }
-        }
+        sort_assets(cfg, assets, &mut out);
         match next {
             Some(n) if n > page => page = n,
             _ => break,
@@ -440,6 +553,7 @@ impl crate::Session {
             }
             self.immich_previews = Some((rp, native));
         }
+        self.media.smart_first = cfg.as_ref().map(|c| c.paths.iter().map(|(_, local)| local.clone()).collect()).unwrap_or_default();
         self.immich = cfg;
     }
 

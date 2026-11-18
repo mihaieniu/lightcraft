@@ -67,6 +67,7 @@ impl Default for MediaCache {
             preview_loader: None,
             file_bytes: None,
             smart_dir: None,
+            smart_first: Vec::new(),
             availability: Default::default(),
             scenes: Vec::new(),
             rendered: Arc::new(PreviewCache::memory(rendered_budget(budget))),
@@ -379,7 +380,8 @@ impl MediaCache {
             let sp = if self.availability.exists(&sharded.to_string_lossy()) == Some(true) { sharded } else { legacy };
             // (a proxy cut short fails to load, like the offline original; the worker's fallback
             // in `SourceRef::load` only uses a proxy that passes `smart::is_valid`)
-            if self.availability.is_offline(path) && self.availability.exists(&sp.to_string_lossy()) == Some(true) {
+            let smart_first = level != SourceLevel::Full && self.smart_first.iter().any(|root| crate::immich::is_under(path, root));
+            if (smart_first || self.availability.is_offline(path)) && self.availability.exists(&sp.to_string_lossy()) == Some(true) {
                 return SourceRef::Smart { path: sp };
             }
             let mut r = self.origin_ref(&p.source, max_edge);
