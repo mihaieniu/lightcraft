@@ -20,7 +20,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// A fake Immich: each route is (`"GET /api/albums"`, status, body); a request matches the first route whose key
 /// equals its method and path (query left out). Unknown routes answer 404. Returns the base URL and every request
 /// seen as `"METHOD /path"` plus the raw head, for asserting headers.
-pub(super) fn fake_immich(routes: Vec<(&'static str, u16, String)>) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+pub(crate) fn fake_immich(routes: Vec<(&'static str, u16, String)>) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -64,7 +64,7 @@ pub(super) fn fake_immich(routes: Vec<(&'static str, u16, String)>) -> (String, 
     (url, seen)
 }
 
-pub(super) fn config(url: &str, paths: &[(&str, &str)]) -> Config {
+pub(crate) fn config(url: &str, paths: &[(&str, &str)]) -> Config {
     let map: serde_json::Map<String, serde_json::Value> = paths.iter().map(|(a, b)| ((*a).to_string(), json!(b))).collect();
     Config::from_json(&json!({"url": url, "paths": map}).to_string(), Some("test-key".into()), None).unwrap()
 }

@@ -562,6 +562,11 @@ pub fn post(url: &Url, headers: &[(&str, String)], body: &[u8], limits: &Limits)
     request("POST", url, headers, Some(body), limits)
 }
 
+/// Send `PUT url` with `body`, as [`post`] does.
+pub fn put(url: &Url, headers: &[(&str, String)], body: &[u8], limits: &Limits) -> Result<Response, HttpError> {
+    request("PUT", url, headers, Some(body), limits)
+}
+
 fn request(method: &str, url: &Url, headers: &[(&str, String)], body: Option<&[u8]>, limits: &Limits) -> Result<Response, HttpError> {
     let mut req = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: LightCraft/{}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",

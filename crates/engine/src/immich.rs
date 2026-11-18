@@ -358,7 +358,11 @@ impl<'a> Client<'a> {
         let sent = match body {
             Some(b) => {
                 headers.push(("Content-Type", "application/json".to_string()));
-                http::post(&url, &headers, b.to_string().as_bytes(), &limits)
+                if method == "PUT" {
+                    http::put(&url, &headers, b.to_string().as_bytes(), &limits)
+                } else {
+                    http::post(&url, &headers, b.to_string().as_bytes(), &limits)
+                }
             }
             None if method == "POST" => http::post(&url, &headers, &[], &limits),
             None => http::get(&url, &headers, &limits),
@@ -480,6 +484,25 @@ impl<'a> Client<'a> {
             }
             out.extend_from_slice(buf.get(..n).unwrap_or_default());
         }
+    }
+
+    /// The asset Immich has at `original_path` (as it sees it), if it lists one.
+    pub fn find_asset(&self, original_path: &str) -> Result<Option<String>, String> {
+        let body = json!({"originalPath": original_path, "size": 1, "page": 1, "withExif": false});
+        let (assets, _) = parse_page(&self.json("POST", "/api/search/metadata", Some(&body))?)?;
+        Ok(assets.into_iter().find(|(p, id)| p == original_path && !id.is_empty()).map(|(_, id)| id))
+    }
+
+    /// Make an album: its id.
+    pub fn create_album(&self, name: &str, description: &str) -> Result<String, String> {
+        let v = self.json("POST", "/api/albums", Some(&json!({"albumName": name, "description": description})))?;
+        str_field(&v, "id")
+    }
+
+    /// Add assets `ids` to album `album`.
+    pub fn add_to_album(&self, album: &str, ids: &[String]) -> Result<(), String> {
+        check_id(album)?;
+        self.call("PUT", &format!("/api/albums/{album}/assets"), Some(&json!({"ids": ids}))).map(|_| ())
     }
 
     /// The external libraries.
