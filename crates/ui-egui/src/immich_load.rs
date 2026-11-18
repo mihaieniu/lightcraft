@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use lightcraft_engine::activity::{Cancel, TaskGuard};
-use lightcraft_engine::immich::{Album, AlbumFiles};
+use lightcraft_engine::immich::{Album, AlbumFiles, Config, Folders, Group};
+use lightcraft_engine::immich_retention::Pin;
 use lightcraft_engine::import::{ImportJob, ImportMode, ImportOptions, OnDeleted, Prepared};
 
 use crate::LightcraftApp;
@@ -18,11 +19,54 @@ const BATCH: usize = 200;
 /// The app's Immich state.
 #[derive(Default)]
 pub struct State {
-    /// The server's albums (`None`: not asked yet), or why they couldn't be listed.
-    pub albums: Option<Result<Vec<Album>, String>>,
-    albums_rx: Option<Receiver<Result<Vec<Album>, String>>>,
-    /// The album being loaded.
+    /// The server's albums with their group (`None`: not asked yet), or why they couldn't be listed.
+    pub albums: Option<Result<Vec<(Album, Group)>, String>>,
+    albums_rx: Option<Receiver<Listing>>,
+    /// The server's folders as a tree (empty when they couldn't be listed).
+    pub folders: FolderTree,
+    /// What is kept offline (read when the list arrives and after a change).
+    pub pins: Vec<Pin>,
+    /// The album or folder being loaded.
     pub task: Option<Task>,
+    /// When the unshown photos' smart previews were last expired.
+    expired_at: Option<std::time::Instant>,
+}
+
+type Listing = (Result<Vec<(Album, Group)>, String>, Option<Folders>);
+
+/// Immich's folders under the mapped ones: each mapped folder (as Immich sees it) is a root.
+#[derive(Clone, Debug, Default)]
+pub struct FolderTree {
+    /// (group, root, name shown)
+    pub roots: Vec<(Group, String, String)>,
+    /// folder → the folders directly inside it, sorted
+    pub children: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl FolderTree {
+    /// The tree of `folders` under `cfg`'s mapped folders.
+    pub fn build(cfg: &Config, folders: &Folders) -> FolderTree {
+        let mut tree = FolderTree::default();
+        let mut children: std::collections::HashMap<String, std::collections::BTreeSet<String>> = std::collections::HashMap::new();
+        for (server, local) in &cfg.paths {
+            let in_lr = folders.lightroom.iter().any(|f| lightcraft_engine::immich::is_under(f, server));
+            let group = if in_lr { Group::Lightroom } else { Group::Other };
+            let name = std::path::Path::new(local).file_name().map_or_else(|| server.clone(), |n| n.to_string_lossy().to_string());
+            tree.roots.push((group, server.clone(), name));
+            for f in folders.lightroom.iter().chain(&folders.other).filter(|f| lightcraft_engine::immich::is_under(f, server)) {
+                // every folder between the root and `f`
+                let mut parent = server.clone();
+                for part in f.get(server.len()..).unwrap_or_default().split('/').filter(|p| !p.is_empty()) {
+                    let child = format!("{parent}/{part}");
+                    children.entry(parent).or_default().insert(child.clone());
+                    parent = child;
+                }
+            }
+        }
+        tree.roots.sort_by_key(|r| r.2.to_lowercase());
+        tree.children = children.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
+        tree
+    }
 }
 
 impl State {
@@ -50,6 +94,8 @@ pub struct Task {
     found: AlbumFiles,
     done: u64,
     guard: TaskGuard,
+    /// an album being kept offline: recorded with its photos when they are all read
+    pin: Option<Pin>,
 }
 
 /// Ask the server for its albums on a worker thread (nothing without a config).
@@ -57,7 +103,10 @@ pub fn refresh_albums(app: &mut LightcraftApp) {
     let Some(cfg) = app.session.immich.clone() else { return };
     let (tx, rx) = channel();
     let spawned = std::thread::Builder::new().name("immich-albums".into()).spawn(move || {
-        let _ = tx.send(lightcraft_engine::immich::Client::new(&cfg, &AtomicBool::new(false)).albums());
+        let cancel = AtomicBool::new(false);
+        let albums = lightcraft_engine::immich::albums_with_groups(&cfg, &cancel);
+        let folders = lightcraft_engine::immich::folder_tree(&cfg, &cancel).ok();
+        let _ = tx.send((albums, folders));
     });
     match spawned {
         Ok(_) => app.immich.albums_rx = Some(rx),
@@ -67,6 +116,48 @@ pub fn refresh_albums(app: &mut LightcraftApp) {
 
 /// Show album `id`: the view switches at once and fills in as the worker reads the files.
 pub fn start(app: &mut LightcraftApp, id: &str, name: &str) -> Result<(), String> {
+    let album = id.to_string();
+    start_with(app, id, name, None, move |cfg, c| lightcraft_engine::immich::album_files(cfg, &album, c))
+}
+
+/// Show the photos directly in Immich folder `path` (as Immich sees it).
+pub fn start_folder(app: &mut LightcraftApp, path: &str, name: &str) -> Result<(), String> {
+    let folder = path.to_string();
+    start_with(app, &format!("folder:{path}"), name, None, move |cfg, c| lightcraft_engine::immich::folder_files(cfg, &folder, c))
+}
+
+/// Keep a folder (and the folders in it) or an album offline: it is shown, and its photos' smart previews are
+/// fetched and kept for good.
+pub fn keep_offline(app: &mut LightcraftApp, pin: Pin, name: &str) -> Result<(), String> {
+    let view = match &pin {
+        Pin::Folder(f) => {
+            // a folder pin needs no list of photos: it is recorded now
+            lightcraft_engine::immich_retention::add_pin(&mut app.session, pin.clone());
+            format!("folder:{f}")
+        }
+        Pin::Album { id, .. } => id.clone(),
+    };
+    app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);
+    let p = pin.clone();
+    let album_pin = matches!(pin, Pin::Album { .. }).then_some(pin);
+    start_with(app, &view, name, album_pin, move |cfg, c| lightcraft_engine::immich_retention::pin_files(cfg, &p, c))
+}
+
+/// Stop keeping `pin` offline (its smart previews then expire like the others).
+pub fn stop_keeping(app: &mut LightcraftApp, pin: &Pin) {
+    lightcraft_engine::immich_retention::remove_pin(&mut app.session, pin);
+    app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);
+}
+
+/// Show view `id` (`name`) and fill it, batch by batch, with the photos `files` lists (on a worker thread). An album
+/// `pin` is recorded with the album's photos once they are all read.
+fn start_with(
+    app: &mut LightcraftApp,
+    id: &str,
+    name: &str,
+    pin: Option<Pin>,
+    files: impl FnOnce(&Config, &AtomicBool) -> Result<AlbumFiles, String> + Send + 'static,
+) -> Result<(), String> {
     let cfg = app.session.immich.clone().ok_or("Immich is not set up")?;
     stop(app);
     // like a Local browse: read in place, never bringing deleted photos back
@@ -77,12 +168,12 @@ pub fn start(app: &mut LightcraftApp, id: &str, name: &str) -> Result<(), String
     let guard = app.session.activity.start("immich", &format!("Loading Immich album {name}"), Cancel::Flag(cancel.clone()));
     app.session.show_immich_album(id, name, String::new());
     let (tx, rx) = channel();
-    let (c, album) = (cancel.clone(), id.to_string());
+    let c = cancel.clone();
     // the preview server (CRAFT-9) is told which photos the import will ask it about
     let remote = app.session.immich_previews.as_ref().map(|(rp, _)| rp.clone());
     let smart_dir = app.session.media.smart_dir.clone();
     let work = move || {
-        let found = match lightcraft_engine::immich::album_files(&cfg, &album, &c) {
+        let found = match files(&cfg, &c) {
             Ok(f) => f,
             Err(e) => {
                 let _ = tx.send(Msg::Failed(e));
@@ -109,7 +200,8 @@ pub fn start(app: &mut LightcraftApp, id: &str, name: &str) -> Result<(), String
         let _ = tx.send(Msg::Done);
     };
     std::thread::Builder::new().name("immich-album".into()).spawn(work).map_err(|e| e.to_string())?;
-    app.immich.task = Some(Task { id: id.to_string(), name: name.to_string(), rx, cancel, opts, now, found: AlbumFiles::default(), done: 0, guard });
+    app.immich.task =
+        Some(Task { id: id.to_string(), name: name.to_string(), rx, cancel, opts, now, found: AlbumFiles::default(), done: 0, guard, pin });
     Ok(())
 }
 
@@ -128,12 +220,29 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     if let Some(rx) = &app.immich.albums_rx {
         match rx.try_recv() {
-            Ok(r) => {
-                app.immich.albums = Some(r);
+            Ok((albums, folders)) => {
+                app.immich.albums = Some(albums);
+                app.immich.folders = match (&app.session.immich, folders) {
+                    (Some(cfg), Some(f)) => FolderTree::build(cfg, &f),
+                    _ => FolderTree::default(),
+                };
+                app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);
                 app.immich.albums_rx = None;
             }
             Err(TryRecvError::Disconnected) => app.immich.albums_rx = None,
             Err(TryRecvError::Empty) => ctx.request_repaint(),
+        }
+    }
+    // once at start and then daily: the smart previews of unpinned Immich photos not shown for the keep days go
+    // ponytail: runs on the UI thread (a file check per Immich photo); move to a worker if libraries get huge
+    if app.session.immich.is_some()
+        && app.session.media.smart_dir.is_some()
+        && app.immich.expired_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(86_400))
+    {
+        app.immich.expired_at = Some(std::time::Instant::now());
+        let gone = lightcraft_engine::immich_retention::expire(&mut app.session, lightcraft_engine::immich_retention::now());
+        if gone.removed > 0 {
+            log::info!("Immich: {} smart previews not shown for a while were deleted ({} bytes)", gone.removed, gone.bytes);
         }
     }
     let Some(mut task) = app.immich.task.take() else { return };
@@ -165,6 +274,13 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             Ok(Msg::Done) | Err(TryRecvError::Disconnected) => {
                 // what the preview server didn't do is built here
                 app.session.build_queued_immich_previews();
+                // shown now: their smart previews' keep days start again
+                let shown = app.session.visible().to_vec();
+                lightcraft_engine::immich_retention::touch(&mut app.session, &shown);
+                if let Some(Pin::Album { id, .. }) = task.pin.take() {
+                    lightcraft_engine::immich_retention::add_pin(&mut app.session, Pin::Album { id, paths: task.found.files.clone() });
+                    app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);
+                }
                 // the album's folders count as browsed: their untouched photos aren't forgotten while it is in use
                 let root = app.session.immich_view.as_ref().map(|v| v.root.clone()).unwrap_or_default();
                 app.session.note_browsed(&root, &task.found.files);

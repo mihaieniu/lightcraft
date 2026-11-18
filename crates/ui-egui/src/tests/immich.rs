@@ -186,3 +186,67 @@ fn a_failed_rescan_is_shown() {
     rescans.wait_idle();
     assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t.contains("Immich could not rescan"))), "{:?}", h.painted_text());
 }
+
+/// Immich heads My Photos (CRAFT-9): above the library's sections, split into Lightroom and Phone & cloud, each with
+/// its folders and albums; a folder's menu keeps it offline.
+#[test]
+fn immich_section_is_first_with_groups_and_pins() {
+    let dir = temp("groups");
+    std::fs::create_dir_all(dir.join("lr/2024")).unwrap();
+    std::fs::create_dir_all(dir.join("gp/Trip")).unwrap();
+    png(&dir.join("lr/2024/a.png"), 1);
+    let url = fake_immich(vec![
+        (
+            "GET /api/albums",
+            json!([{"id": "al1", "albumName": "Wedding", "assetCount": 1}, {"id": "al2", "albumName": "Phone Stuff", "assetCount": 1}]).to_string(),
+        ),
+        (
+            "GET /api/libraries",
+            json!([
+                {"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]},
+                {"id": "L2", "name": "GooglePhotos", "importPaths": ["/mnt/media/GooglePhotos"]}
+            ])
+            .to_string(),
+        ),
+        (
+            "POST /api/search/metadata",
+            json!({"assets": {"items": [{"originalPath": "/mnt/media/Lightroom/2024/a.png", "id": "a"}], "nextPage": null}}).to_string(),
+        ),
+        ("GET /api/view/folder/unique-paths", json!(["/mnt/media/Lightroom/2024", "/mnt/media/GooglePhotos/Trip"]).to_string()),
+    ]);
+    let text = json!({"url": url, "paths": {"/mnt/media/Lightroom": dir.join("lr").to_string_lossy(), "/mnt/media/GooglePhotos": dir.join("gp").to_string_lossy()}}).to_string();
+    let cfg = lightcraft_engine::immich::Config::from_json(&text, Some("k".into()), None).unwrap();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(dir.join("library"), false).unwrap();
+    session.set_immich(Some(cfg));
+    let mut app = LightcraftApp::new(session, crate::Services { png: None, ..Default::default() });
+    crate::panels::empty_library::open_on_empty_library(&mut app);
+    let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+    assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t == "Wedding")), "{:?}", h.painted_text());
+    h.settle(T);
+    let painted = h.painted_text();
+    for want in ["Lightroom", "Phone & cloud", "Wedding", "Phone Stuff"] {
+        assert!(painted.iter().any(|t| t == want), "{want} in {painted:?}");
+    }
+    // Immich is drawn above the library's own sections
+    let immich = crate::control::widget_rect(&h.app, "button:immichRefresh").expect("the Immich header");
+    let albums = crate::control::widget_rect(&h.app, "sidebarSection:albums").expect("the Albums header");
+    assert!(immich.top() < albums.top(), "Immich {immich:?} above Albums {albums:?}");
+    // the album of Lightroom photos is under Lightroom (the fake answers every album with the same Lightroom page)
+    let lightroom_header = crate::control::widget_rect(&h.app, "text:immichGroup:lightroom").unwrap();
+    let wedding = crate::control::widget_rect(&h.app, "source:immich:al1").unwrap();
+    let phone_header = crate::control::widget_rect(&h.app, "text:immichGroup:other").unwrap();
+    assert!(lightroom_header.top() < wedding.top() && wedding.top() < phone_header.top());
+    // and the folders under the group of their library
+    let lr_root = crate::control::widget_rect(&h.app, "source:immich:folder:/mnt/media/Lightroom").unwrap();
+    let gp_root = crate::control::widget_rect(&h.app, "source:immich:folder:/mnt/media/GooglePhotos").unwrap();
+    assert!(lr_root.top() < phone_header.top() && phone_header.top() < gp_root.top());
+    // Keep Offline from a folder's menu
+    let folder = "source:immich:folder:/mnt/media/Lightroom";
+    assert_eq!(h.request("ui.clickWidget", json!({"id": folder, "button": "right"}), T)["ok"], true);
+    h.settle(T);
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "button:immichPin"}), T)["ok"], true);
+    assert!(h.step_until(T, |h| h.app.immich.task.is_none()));
+    let st = h.app.session.execute("immich.cacheStats", &json!({})).unwrap();
+    assert_eq!(st["pins"], json!([{"folder": "/mnt/media/Lightroom"}]), "{st}");
+}

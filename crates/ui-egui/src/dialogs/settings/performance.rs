@@ -120,6 +120,60 @@ pub(super) fn performance_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &To
     );
     #[cfg(not(target_arch = "wasm32"))]
     smart_previews(app, ui, t);
+    #[cfg(not(target_arch = "wasm32"))]
+    immich_cache(app, ui, t);
+}
+
+/// Settings ▸ Performance ▸ Immich offline cache (CRAFT-9): the Immich photos' smart previews kept for good (pinned)
+/// and for now, how long an unshown photo keeps its smart preview, and Clear Temporary.
+#[cfg(not(target_arch = "wasm32"))]
+fn immich_cache(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    if app.session.immich.is_none() || app.session.media.smart_dir.is_none() {
+        return;
+    }
+    // counting the files every frame would be slow: refresh every 2 s and after a change
+    let cache = egui::Id::unique("immich-cache-stats");
+    let now = ui.input(|i| i.time);
+    let st: Value = match ui.data(|d| d.get_temp::<(f64, Value)>(cache)) {
+        Some((at, v)) if now - at < 2.0 => v,
+        _ => {
+            let v = app.run("immich.cacheStats", json!({})).unwrap_or(Value::Null);
+            ui.data_mut(|d| d.insert_temp(cache, (now, v.clone())));
+            v
+        }
+    };
+    heading(ui, t, crate::i18n::tr("Immich offline cache"));
+    let mb = |v: &Value| v["bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0;
+    let r = ui.label(RichText::new(format!(
+        "Kept offline: {} photos · {:.1} MB    Temporary: {} photos · {:.1} MB",
+        st["kept"]["count"].as_u64().unwrap_or(0),
+        mb(&st["kept"]),
+        st["temporary"]["count"].as_u64().unwrap_or(0),
+        mb(&st["temporary"]),
+    )));
+    register(ui, "text:settingsImmichCache", r.rect);
+    let mut days = u32::try_from(st["keepDays"].as_u64().unwrap_or(30)).unwrap_or(30);
+    let changed = row(ui, t, crate::i18n::tr("Keep temporary previews"), |ui| {
+        choices(ui, "settingsImmichKeep", &[(7u32, "7 days"), (30, "30 days"), (90, "90 days"), (0, "Forever")], &mut days)
+    });
+    if changed {
+        let _ = app.run("immich.keepDays", json!({"days": days}));
+        ui.data_mut(|d| d.remove::<(f64, Value)>(cache));
+    }
+    hint(
+        ui,
+        t,
+        "Immich photos get smart previews when their folder or album is opened, built by the preview server when there is one. Folders and albums kept offline (their menu in the sidebar) keep them for good; the others are deleted once not shown for this long.",
+    );
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W);
+        let r = ui.button(crate::i18n::tr("Clear Temporary"));
+        register(ui, "button:settingsImmichClear", r.rect);
+        if r.clicked() {
+            let _ = app.run("immich.clearTemporary", json!({}));
+            ui.data_mut(|d| d.remove::<(f64, Value)>(cache));
+        }
+    });
 }
 
 /// Settings ▸ Performance ▸ Prepare photos in the background (notes 47 and 48): per mode, what

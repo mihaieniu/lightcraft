@@ -83,31 +83,6 @@ fn pin_param(c: &str, p: &Value) -> Result<crate::immich_retention::Pin> {
     }
 }
 
-/// Every photo a pin keeps: a folder and the folders inside it, or an album. Network: a worker thread's job.
-pub fn pin_files(
-    cfg: &crate::immich::Config,
-    pin: &crate::immich_retention::Pin,
-    cancel: &AtomicBool,
-) -> std::result::Result<crate::immich::AlbumFiles, String> {
-    use crate::immich_retention::Pin;
-    match pin {
-        Pin::Album { id, .. } => crate::immich::album_files(cfg, id, cancel),
-        Pin::Folder(root) => {
-            let client = crate::immich::Client::new(cfg, cancel);
-            let mut out = crate::immich::AlbumFiles::default();
-            for f in client.folders()?.into_iter().filter(|f| crate::immich::is_under(f, root)) {
-                let found = crate::immich::folder_files(cfg, &f, cancel)?;
-                out.files.extend(found.files);
-                out.assets.extend(found.assets);
-                out.unmapped += found.unmapped;
-                out.missing += found.missing;
-                out.skipped += found.skipped;
-            }
-            Ok(out)
-        }
-    }
-}
-
 /// Import `found` in place without showing it (the preview server describing it when there is one).
 pub fn fetch_files(s: &mut Session, found: &crate::immich::AlbumFiles) -> Result<usize> {
     let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: OnDeleted::Skip, ..Default::default() };
@@ -123,8 +98,11 @@ fn pin(s: &mut Session, p: &Value) -> Result<Value> {
     let cfg = config(s, C)?.clone();
     let mut pin = pin_param(C, p)?;
     let fetch = p.get("fetch").and_then(Value::as_bool).unwrap_or(true);
-    let found =
-        if fetch || matches!(pin, Pin::Album { .. }) { Some(pin_files(&cfg, &pin, &AtomicBool::new(false)).map_err(|e| bad(C, e))?) } else { None };
+    let found = if fetch || matches!(pin, Pin::Album { .. }) {
+        Some(crate::immich_retention::pin_files(&cfg, &pin, &AtomicBool::new(false)).map_err(|e| bad(C, e))?)
+    } else {
+        None
+    };
     if let (Pin::Album { paths, .. }, Some(f)) = (&mut pin, &found) {
         paths.clone_from(&f.files);
     }

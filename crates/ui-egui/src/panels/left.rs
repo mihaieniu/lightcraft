@@ -145,6 +145,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 // …and the sidebar scrolls to it
                 ui.data_mut(|d| d.insert_temp(egui::Id::unique(SCROLL_TO_ROW), format!("libfolder:{path}").to_lowercase()));
             }
+            // Immich heads My Photos (CRAFT-9): above the library's own sections
+            #[cfg(not(target_arch = "wasm32"))]
+            immich::section(app, ui);
             // Local keeps track of the folder being browsed whether or not it is drawn
             let local = local_now(app, ui);
             let shown: Vec<SidebarSection> = app.ui.sidebar.shown().collect();
@@ -178,8 +181,6 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 placed.push(at);
             }
             ui.data_mut(|d| d.remove::<String>(egui::Id::unique(SCROLL_TO_ROW)));
-            #[cfg(not(target_arch = "wasm32"))]
-            immich::section(app, ui);
             // room below the last section (a section dragged to the end is dropped here)
             ui.add_space(SECTION_GAP * 2.0);
             pinned_header(app, ui, &placed, view_top);

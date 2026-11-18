@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use lightcraft_catalog::{PhotoId, Source};
 use serde::{Deserialize, Serialize};
@@ -196,4 +197,28 @@ pub fn stats(s: &Session) -> ((usize, u64), (usize, u64)) {
         slot.1 += m.len();
     }
     (kept, temp)
+}
+
+/// Every photo a pin keeps: a folder and the folders inside it, or an album. Network: a worker thread's job.
+pub fn pin_files(
+    cfg: &crate::immich::Config,
+    pin: &crate::immich_retention::Pin,
+    cancel: &AtomicBool,
+) -> std::result::Result<crate::immich::AlbumFiles, String> {
+    match pin {
+        Pin::Album { id, .. } => crate::immich::album_files(cfg, id, cancel),
+        Pin::Folder(root) => {
+            let client = crate::immich::Client::new(cfg, cancel);
+            let mut out = crate::immich::AlbumFiles::default();
+            for f in client.folders()?.into_iter().filter(|f| crate::immich::is_under(f, root)) {
+                let found = crate::immich::folder_files(cfg, &f, cancel)?;
+                out.files.extend(found.files);
+                out.assets.extend(found.assets);
+                out.unmapped += found.unmapped;
+                out.missing += found.missing;
+                out.skipped += found.skipped;
+            }
+            Ok(out)
+        }
+    }
 }
