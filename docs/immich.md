@@ -72,6 +72,13 @@ On the laptop, add to `immich.json` and save the same token in a file only you c
 "worker": { "addr": "100.100.5.5:7991", "token_file": "~/.config/lightcraft/worker-token" }
 ```
 
+In the sidebar, Immich comes first: **Lightroom** (the libraries named in `"lightroom_libraries"`, default
+`["Lightroom"]`) and **Phone & cloud** (the others and phone uploads), each with its folders and albums. A row's
+menu has **Keep Offline**: its photos' smart previews are fetched now and kept for good (a dot marks the row). Other
+Immich photos keep theirs until not shown for 30 days (Settings ▸ Performance ▸ Immich offline cache, which also
+shows the sizes and clears the temporary ones). After the worker failed three times in a row the laptop builds
+smart previews itself until LightCraft is restarted.
+
 **The protocol is not encrypted** (as AI Denoise's): publish the worker on a VPN (Tailscale) or LAN address
 only. Both sides must be built from the same revision; a worker that builds smart previews differently is
 refused at its greeting and the laptop builds them itself.

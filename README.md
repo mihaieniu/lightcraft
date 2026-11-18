@@ -83,6 +83,7 @@
 This fork adds, on top of upstream LightCraft:
 
 - **[Immich](docs/immich.md)**: browse and edit the albums of a self-hosted Immich server from its mounted storage, and have Immich rescan after imports and exports.
+- **Immich as My Photos**: Immich heads the sidebar, split into Lightroom and Phone & cloud folders and albums. Opening one fetches smart previews from a [worker container](docs/immich.md#smart-previews-from-another-computer) on a computer next to the NAS, so originals are read only when a photo is opened full size; Keep Offline pins a folder or album, everything else expires after 30 days unseen.
 - **AI Subject and Background masks**: SAM 3 selects the people and animals in focus with what they hold (Background is its exact inverse), and a first Object click selects the whole object.
 
 ## Edit like you mean it
