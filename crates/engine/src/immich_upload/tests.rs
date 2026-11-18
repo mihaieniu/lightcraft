@@ -41,11 +41,11 @@ fn routes(found: &[&str]) -> Vec<(&'static str, u16, String)> {
         ("PUT /api/albums/NEW/assets", 200, "[]".into()),
         ("PUT /api/albums/EX/assets", 200, "[]".into()),
     ];
-    for name in found {
-        let key: &'static str = Box::leak(format!("POST /api/search/metadata|/mnt/media/Lightroom/{DAY}/{name}").into_boxed_str());
-        r.push((key, 200, json!({"assets": {"items": [{"originalPath": format!("/mnt/media/Lightroom/{DAY}/{name}"), "id": format!("asset-{name}")}], "nextPage": null}}).to_string()));
-    }
-    r.push(("POST /api/search/metadata", 200, json!({"assets": {"items": [], "nextPage": null}}).to_string()));
+    let items: Vec<_> = found
+        .iter()
+        .map(|name| json!({"originalPath": format!("/mnt/media/Lightroom/{DAY}/{name}"), "id": format!("asset-{name}"), "type": "IMAGE"}))
+        .collect();
+    r.push(("GET /api/view/folder", 200, json!(items).to_string()));
     r
 }
 
@@ -127,4 +127,70 @@ fn upload_resumes_after_a_failure() {
     let r = go(&cfg_for(&url, &nas), &mut again).unwrap();
     assert_eq!(r.added, 1);
     assert!(again.done());
+}
+
+// ---- review fixes ----
+
+#[test]
+fn a_copy_never_recreates_the_servers_folder() {
+    let d = temp_dir("root-gone");
+    std::fs::write(d.join("a.arw"), "x").unwrap();
+    let root = d.join("mount-gone");
+    assert!(copy_to_nas(&d.join("a.arw"), &root, Path::new("2026/2026-11-18/a.arw")).is_err());
+    assert!(!root.exists(), "the mount's folder is never made here");
+}
+
+#[test]
+fn a_different_photo_of_the_same_size_is_not_taken_for_ours() {
+    let (staging, nas, files) = setup("same-size", &["a.arw"]);
+    std::fs::create_dir_all(nas.join(DAY)).unwrap();
+    // same length as "raw bytes of a.arw", other bytes
+    std::fs::write(nas.join(DAY).join("a.arw"), "RAW BYTES OF A.ARW").unwrap();
+    let (url, _) = fake_immich(routes(&["a.arw"]));
+    let mut job = Job::new(files, staging.to_string_lossy().to_string(), Target::Album("EX".into()));
+    let r = go(&cfg_for(&url, &nas), &mut job).unwrap();
+    assert_eq!((r.added, r.failed.len()), (0, 1), "{r:?}");
+}
+
+#[test]
+fn a_staged_copy_gone_is_one_files_failure() {
+    let (staging, nas, files) = setup("source-gone", &["a.arw", "b.arw"]);
+    std::fs::remove_file(&files[0]).unwrap();
+    let (url, _) = fake_immich(routes(&["b.arw"]));
+    let mut job = Job::new(files, staging.to_string_lossy().to_string(), Target::Album("EX".into()));
+    let r = go(&cfg_for(&url, &nas), &mut job).unwrap();
+    assert_eq!((r.added, r.failed.len()), (1, 1), "{r:?}");
+    assert!(job.done());
+}
+
+#[test]
+fn assets_are_found_by_their_exact_path_in_the_day_folder() {
+    let (staging, nas, files) = setup("exact", &["a.arw"]);
+    // a path search would also match another library's a.arw; the folder listing has only this one
+    let (url, seen) = fake_immich(routes(&["a.arw"]));
+    let mut job = Job::new(files, staging.to_string_lossy().to_string(), Target::Album("EX".into()));
+    assert_eq!(go(&cfg_for(&url, &nas), &mut job).unwrap().added, 1);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|(k, head)| k == "GET /api/view/folder" && head.contains("2026%2F2026-11-18") || head.contains("2026/2026-11-18")));
+    assert!(!seen.iter().any(|(k, _)| k == "POST /api/search/metadata"), "no search per file");
+}
+
+#[test]
+fn saving_jobs_from_two_threads_loses_none() {
+    let d = temp_dir("jobs-race");
+    let file = d.join("jobs.json");
+    let threads: Vec<_> = (0..4)
+        .map(|t| {
+            let f = file.clone();
+            std::thread::spawn(move || {
+                for i in 0..10 {
+                    update_jobs(&f, |jobs| jobs.push(Job::new(vec![format!("{t}-{i}")], String::new(), Target::Album("x".into())))).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(load_jobs(&file).len(), 40);
 }

@@ -897,3 +897,18 @@ fn cover_bytes_are_capped() {
     assert!(!d.join("huge.webp").exists(), "nothing written for a refused cover");
     assert!(crate::immich::cached_cover(&c, "../x", &d, &cancel).is_err(), "never a path");
 }
+
+#[test]
+fn a_cover_declaring_a_huge_size_is_not_decoded() {
+    // a PNG header claiming 60 000 × 60 000 pixels
+    let img = lightcraft_raster::Rgba8::from_fn(4, 4, |_, _| [9, 9, 9, 255]);
+    let mut png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    png[16..20].copy_from_slice(&60_000u32.to_be_bytes());
+    png[20..24].copy_from_slice(&60_000u32.to_be_bytes());
+    assert!(crate::immich::cover_pixels(&png).is_none());
+    // a real small one decodes, to at most 128 px
+    let big = lightcraft_raster::Rgba8::from_fn(400, 300, |_, _| [9, 9, 200, 255]);
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&big), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    let px = crate::immich::cover_pixels(&png).unwrap();
+    assert!(px.width <= 128 && px.height <= 128, "{}x{}", px.width, px.height);
+}

@@ -591,7 +591,9 @@ pub fn covers_dir() -> Option<PathBuf> {
 
 /// A cover thumbnail file's pixels (8-bit sRGB), when it decodes.
 pub fn cover_pixels(bytes: &[u8]) -> Option<lightcraft_raster::Rgba8> {
-    lightcraft_codecs::decode(bytes, lightcraft_codecs::DecodeOptions::default()).ok().map(|d| d.to_srgb8())
+    // a cover is shown small: never a huge picture decoded for it, whatever its header says
+    let opts = lightcraft_codecs::DecodeOptions { max_size: Some((128, 128)), max_pixels: 4_000_000 };
+    lightcraft_codecs::decode(bytes, opts).ok().map(|d| d.to_srgb8())
 }
 
 /// Asset `asset`'s cover thumbnail file in `dir`: read from there, else fetched from the server and kept.

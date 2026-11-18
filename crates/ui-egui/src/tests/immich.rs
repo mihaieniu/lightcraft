@@ -35,7 +35,7 @@ fn fake_immich(routes: Vec<(&'static str, String)>) -> String {
             let mut body = vec![0u8; len];
             let _ = r.read_exact(&mut body);
             let mut p = first.split_whitespace();
-            let key = format!("{} {}", p.next().unwrap_or_default(), p.next().unwrap_or_default());
+            let key = format!("{} {}", p.next().unwrap_or_default(), p.next().unwrap_or_default().split('?').next().unwrap_or_default());
             let route = routes.iter().find(|(k, _)| k.trim_end_matches("~slow") == key);
             if route.is_some_and(|(k, _)| k.ends_with("~slow")) {
                 std::thread::sleep(Duration::from_millis(500));
@@ -320,11 +320,7 @@ fn import_to_a_new_immich_album_sends_the_photos() {
     let url = fake_immich(vec![
         ("GET /api/libraries", json!([{"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]}]).to_string()),
         ("POST /api/libraries/L1/scan", String::new()),
-        (
-            "POST /api/search/metadata",
-            json!({"assets": {"items": [{"originalPath": "/mnt/media/Lightroom/2026/2026-11-18/DSC1.ARW", "id": "A1"}], "nextPage": null}})
-                .to_string(),
-        ),
+        ("GET /api/view/folder", json!([{"originalPath": "/mnt/media/Lightroom/2026/2026-11-18/DSC1.ARW", "id": "A1", "type": "IMAGE"}]).to_string()),
         ("POST /api/albums", json!({"id": "NEW"}).to_string()),
         ("PUT /api/albums/NEW/assets", "[]".into()),
         ("GET /api/albums", "[]".into()),
@@ -345,4 +341,48 @@ fn import_to_a_new_immich_album_sends_the_photos() {
     assert!(h.step_until(T, |h| !h.app.immich.uploading()), "the upload finishes");
     assert_eq!(std::fs::read(nas.join("2026/2026-11-18/DSC1.ARW")).unwrap(), b"raw");
     assert!(lightcraft_engine::immich_upload::load_jobs(&jobs).is_empty(), "nothing left pending");
+}
+
+/// A send that fails (its album was deleted in Immich) doesn't hold up the next one (CRAFT-11 review).
+#[test]
+fn a_failing_send_does_not_block_the_next() {
+    let dir = temp("upload-blocked");
+    let (staging, nas) = (dir.join("staging"), dir.join("nas"));
+    std::fs::create_dir_all(staging.join("2026/2026-11-18")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let (a, b) = (staging.join("2026/2026-11-18/A.ARW"), staging.join("2026/2026-11-18/B.ARW"));
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let url = fake_immich(vec![
+        ("GET /api/libraries", json!([{"id": "L1", "name": "Lightroom", "importPaths": ["/mnt/media/Lightroom"]}]).to_string()),
+        ("POST /api/libraries/L1/scan", String::new()),
+        (
+            "GET /api/view/folder",
+            json!([
+                {"originalPath": "/mnt/media/Lightroom/2026/2026-11-18/A.ARW", "id": "IA", "type": "IMAGE"},
+                {"originalPath": "/mnt/media/Lightroom/2026/2026-11-18/B.ARW", "id": "IB", "type": "IMAGE"}
+            ])
+            .to_string(),
+        ),
+        ("PUT /api/albums/OK/assets", "[]".into()),
+        ("GET /api/albums", "[]".into()),
+    ]);
+    let text = json!({"url": url, "paths": {"/mnt/media/Lightroom": nas.to_string_lossy()}}).to_string();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.set_immich(Some(lightcraft_engine::immich::Config::from_json(&text, Some("k".into()), None).unwrap()));
+    let app = LightcraftApp::new(session, crate::Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+    let jobs = dir.join("jobs.json");
+    h.app.immich.uploads_file = Some(jobs.clone());
+    h.app.immich.uploads_resumed = true;
+    use lightcraft_engine::immich_upload::{Job, Target, load_jobs};
+    let s = staging.to_string_lossy().to_string();
+    // adding to the first album is refused (an id Immich would never give); the second is fine
+    crate::immich_upload_ui::send(&mut h.app, Job::new(vec![a.to_string_lossy().to_string()], s.clone(), Target::Album("GONE!".into())));
+    crate::immich_upload_ui::send(&mut h.app, Job::new(vec![b.to_string_lossy().to_string()], s, Target::Album("OK".into())));
+    assert!(h.step_until(T, |h| !h.app.immich.uploading()));
+    let left = load_jobs(&jobs);
+    assert_eq!(left.len(), 1, "only the failing one waits: {left:?}");
+    assert_eq!(left[0].target, Target::Album("GONE!".into()));
+    assert_eq!(left[0].attempts, 1);
 }

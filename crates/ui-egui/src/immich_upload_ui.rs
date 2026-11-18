@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
 use lightcraft_engine::activity::{Cancel, TaskGuard};
-use lightcraft_engine::immich_upload::{Job, Report, load_jobs, run, save_jobs};
+use lightcraft_engine::immich_upload::{Job, MAX_ATTEMPTS, Report, load_jobs, run, update_jobs};
 
 use crate::LightcraftApp;
 
@@ -36,21 +36,21 @@ fn jobs_file(app: &LightcraftApp) -> Option<PathBuf> {
 /// Queue `job` and start sending.
 pub fn send(app: &mut LightcraftApp, job: Job) {
     let Some(file) = jobs_file(app) else { return };
-    let mut jobs = load_jobs(&file);
-    jobs.push(job);
-    if let Err(e) = save_jobs(&file, &jobs) {
+    if let Err(e) = update_jobs(&file, |jobs| jobs.push(job)) {
         log::warn!("Immich uploads: {e}");
     }
-    start(app);
+    start(app, false);
 }
 
-/// Run the pending jobs on a worker thread (nothing when one runs, or none are pending).
-fn start(app: &mut LightcraftApp) {
+/// Run the pending jobs on a worker thread (nothing when one runs, or none are pending). Jobs that failed before
+/// are tried again only with `retry` (once per app start).
+fn start(app: &mut LightcraftApp, retry: bool) {
     if app.immich.upload.is_some() {
         return;
     }
     let (Some(cfg), Some(file)) = (app.session.immich.clone(), jobs_file(app)) else { return };
-    let pending = load_jobs(&file).into_iter().filter(|j| !j.done()).count();
+    let wanted = move |j: &Job| !j.done() && (retry || j.attempts == 0);
+    let pending = load_jobs(&file).iter().filter(|j| wanted(j)).count();
     if pending == 0 {
         return;
     }
@@ -58,29 +58,40 @@ fn start(app: &mut LightcraftApp) {
     let (poll, timeout) = if cfg!(test) { (Duration::from_millis(20), Duration::from_secs(5)) } else { (POLL, TIMEOUT) };
     let spawned = std::thread::Builder::new().name("immich-upload".into()).spawn(move || {
         let cancel = AtomicBool::new(false);
-        while let Some(mut job) = load_jobs(&file).into_iter().find(|j| !j.done()) {
+        // each pending job once, in order: one that fails waits for the next start and doesn't hold up the others
+        for mut job in load_jobs(&file).into_iter().filter(wanted) {
             let save = |j: &Job| {
-                let mut all = load_jobs(&file);
-                if let Some(x) = all.iter_mut().find(|x| x.files == j.files) {
-                    *x = j.clone();
-                }
-                let _ = save_jobs(&file, &all);
+                let _ = update_jobs(&file, |all| {
+                    if let Some(x) = all.iter_mut().find(|x| x.files == j.files) {
+                        *x = j.clone();
+                    }
+                });
             };
             let progress = |done: u64, total: u64, what: &str| {
                 let _ = tx.send(Msg::Progress(done, total, what.to_string()));
             };
             let r = run(&cfg, &mut job, &progress, &save, &cancel, poll, timeout);
-            let failed = r.is_err();
-            if !failed {
+            let files = job.files.clone();
+            let r = match r {
                 // done: off the list
-                let all: Vec<Job> = load_jobs(&file).into_iter().filter(|x| x.files != job.files).collect();
-                let _ = save_jobs(&file, &all);
-            }
+                Ok(rep) => {
+                    let _ = update_jobs(&file, |all| all.retain(|x| x.files != files));
+                    Ok(rep)
+                }
+                Err(e) => {
+                    job.attempts += 1;
+                    let gave_up = job.attempts >= MAX_ATTEMPTS;
+                    let _ = update_jobs(&file, |all| {
+                        if gave_up {
+                            all.retain(|x| x.files != files);
+                        } else if let Some(x) = all.iter_mut().find(|x| x.files == files) {
+                            x.attempts = job.attempts;
+                        }
+                    });
+                    Err(if gave_up { format!("{e} — given up after {MAX_ATTEMPTS} tries") } else { e })
+                }
+            };
             let _ = tx.send(Msg::Finished(r));
-            // a failed job waits for the next start (the server or its folder is away)
-            if failed {
-                break;
-            }
         }
         let _ = tx.send(Msg::AllDone);
     });
@@ -94,7 +105,7 @@ fn start(app: &mut LightcraftApp) {
 pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     if !app.immich.uploads_resumed && app.session.immich.is_some() {
         app.immich.uploads_resumed = true;
-        start(app);
+        start(app, true);
     }
     let Some(up) = app.immich.upload.take() else { return };
     loop {
@@ -106,7 +117,7 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             Ok(Msg::Finished(Ok(r))) => {
                 let mut msg = format!("Immich: {} photos added to the album", r.added);
                 if !r.missing.is_empty() {
-                    msg.push_str(&format!("; {} not listed by Immich yet", r.missing.len()));
+                    msg.push_str(&format!("; {} copied to the server but not listed by Immich (add them to the album there)", r.missing.len()));
                 }
                 if !r.failed.is_empty() {
                     msg.push_str(&format!("; {} not sent: {}", r.failed.len(), r.failed.iter().map(|(_, why)| why.as_str()).next().unwrap_or("")));
@@ -114,8 +125,16 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 app.toast(ctx, msg);
                 crate::immich_load::refresh_albums(app);
             }
-            Ok(Msg::Finished(Err(e))) => app.toast_error(ctx, format!("Sending photos to Immich stopped: {e} (it carries on at the next start)")),
-            Ok(Msg::AllDone) | Err(TryRecvError::Disconnected) => return,
+            Ok(Msg::Finished(Err(e))) => app.toast_error(ctx, format!("Sending photos to Immich stopped: {e}")),
+            Ok(Msg::AllDone) | Err(TryRecvError::Disconnected) => {
+                // a job queued while the sender was finishing is started now (a failed one waits for the next start)
+                if let Some(file) = jobs_file(app)
+                    && load_jobs(&file).iter().any(|j| !j.done() && j.attempts == 0)
+                {
+                    start(app, false);
+                }
+                return;
+            }
             Err(TryRecvError::Empty) => break,
         }
     }
