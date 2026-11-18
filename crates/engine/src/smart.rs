@@ -21,14 +21,25 @@ const MAGIC: &[u8] = b"LCSP1\n";
 
 /// The proxy's file name for a photo (by its content, so copies share one).
 pub fn file_name(p: &Photo) -> String {
-    let h = lightcraft_preview::Hasher128::new().str(&crate::media::content_key(p)).finish();
+    file_name_for_key(&crate::media::content_key(p))
+}
+
+/// The proxy's file name for a content key ([`crate::media::content_key`]): what another computer that
+/// only knows the file's content hash names it.
+pub fn file_name_for_key(content_key: &str) -> String {
+    let h = lightcraft_preview::Hasher128::new().str(content_key).finish();
     format!("{:032x}.lcsp", h.0)
 }
 
 /// The default sharded location of a proxy. A two-character hex prefix bounds each
 /// folder to about 1/256 of the library's smart previews.
 pub fn sharded_file_path(dir: &Path, p: &Photo) -> PathBuf {
-    let name = file_name(p);
+    sharded_path_for_key(dir, &crate::media::content_key(p))
+}
+
+/// [`sharded_file_path`] for a content key.
+pub fn sharded_path_for_key(dir: &Path, content_key: &str) -> PathBuf {
+    let name = file_name_for_key(content_key);
     match name.get(..2) {
         Some(shard) => dir.join(shard).join(&name),
         None => dir.join(&name),

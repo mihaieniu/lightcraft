@@ -627,6 +627,21 @@ fn original_only(source: crate::media::SourceRef) -> Option<crate::media::Source
     }
 }
 
+/// A smart preview's bytes, decoded from `source` and encoded as [`crate::smart::encode`] stores them.
+#[cfg(not(target_arch = "wasm32"))]
+fn proxy_bytes(source: crate::media::SourceRef) -> std::result::Result<Vec<u8>, String> {
+    let src = source.load_source()?;
+    let info = src.info_or(Default::default());
+    crate::smart::encode(&src.image, Some(&info))
+}
+
+/// Photo `p`'s smart preview as Build Smart Previews writes it, without writing it: what a preview server on another
+/// computer sends (`crate::preview_remote`). Reads the original.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn smart_bytes(s: &mut crate::Session, p: &lightcraft_catalog::Photo) -> std::result::Result<Vec<u8>, String> {
+    proxy_bytes(s.media.source_ref_without_profile(p, crate::media::SourceLevel::Preview))
+}
+
 /// The file-system half of Build / Discard Smart Previews (runs on a worker thread in the app).
 /// `custom`: the folder was chosen (on another drive, perhaps): it must be there, it is never
 /// recreated. With `state`, progress and cancel.
@@ -675,21 +690,14 @@ fn smart_run(
                 // atomic: a failed write leaves no partial proxy that would pass for a built one;
                 // and synced (issue #134): built so the photo can be edited while its original
                 // is offline, when it is the only copy — the sync is small next to the decode
-                let r = source
-                    .ok_or_else(|| "nothing to build from".to_string())
-                    .and_then(|s| s.load_source())
-                    .and_then(|src| {
-                        let info = src.info_or(Default::default());
-                        crate::smart::encode(&src.image, Some(&info))
-                    })
-                    .and_then(|b| {
-                        let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
-                        // Only create the leaf shard: do not recreate a missing external drive.
-                        if !parent.is_dir() {
-                            std::fs::create_dir(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-                        }
-                        lightcraft_catalog::safe_file::write_atomic(&path, &b).map_err(|e| format!("{}: {e}", path.display()))
-                    });
+                let r = source.ok_or_else(|| "nothing to build from".to_string()).and_then(proxy_bytes).and_then(|b| {
+                    let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
+                    // Only create the leaf shard: do not recreate a missing external drive.
+                    if !parent.is_dir() {
+                        std::fs::create_dir(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    lightcraft_catalog::safe_file::write_atomic(&path, &b).map_err(|e| format!("{}: {e}", path.display()))
+                });
                 match r {
                     Ok(()) => {
                         n.built += 1;

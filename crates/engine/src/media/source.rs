@@ -367,8 +367,10 @@ impl SourceRef {
     }
 }
 
-/// What an import learns from a file header (set by the app from `lightcraft-codecs`/`-raw`).
-#[derive(Clone, Debug, Default)]
+/// What an import learns from a file header (set by the app from `lightcraft-codecs`/`-raw`). Serializable: a
+/// preview server on another computer sends it (`crate::preview_remote`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProbeInfo {
     pub width: u32,
     pub height: u32,
