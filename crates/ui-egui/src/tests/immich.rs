@@ -294,6 +294,12 @@ fn albums_show_covers_names_and_years() {
     assert!(top(&h, "source:immich:a2") < top(&h, "text:immichYear:other:2024"));
     assert!(top(&h, "text:immichYear:other:2024") < top(&h, "source:immich:a3"));
     assert!(h.step_until(T, |h| crate::control::widget_rect(&h.app, "cover:immich:a1").is_some()), "the cover is drawn");
+    // …with the cover's own pixels (blue 200), not a placeholder
+    h.settle(T);
+    let at = crate::control::widget_rect(&h.app, "cover:immich:a1").unwrap().center();
+    let img = h.snapshot(T);
+    let px = img.pixels[(at.y as usize) * img.size[0] + at.x as usize];
+    assert!(px.b() > 150 && px.b() > px.r() + 40, "the cover shows: {px:?}");
     // by name: within 2026, Apples before Trip
     assert_eq!(h.request("engine.execute", json!({"command": "view.immichAlbumSort", "params": {"sort": "name"}}), T)["ok"], true);
     assert_eq!(h.app.ui.immich_album_sort, lightcraft_engine::immich::AlbumSort::Name);
