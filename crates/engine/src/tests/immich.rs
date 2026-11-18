@@ -145,8 +145,8 @@ fn client_reports_refused_key_and_connection_refused() {
     let cancel = AtomicBool::new(false);
     let e = Client::new(&c, &cancel).albums().unwrap_err();
     assert!(e.contains("API key"), "{e}");
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let c = config(&format!("http://127.0.0.1:{port}"), &[]);
+    // port 1: a freed ephemeral port could be taken by another test's server meanwhile
+    let c = config("http://127.0.0.1:1", &[]);
     let e = Client::new(&c, &cancel).albums().unwrap_err();
     assert!(e.contains("unreachable"), "{e}");
 }
