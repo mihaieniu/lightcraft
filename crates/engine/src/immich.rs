@@ -180,6 +180,14 @@ pub(crate) fn parse_libraries(v: &Value) -> Result<Vec<Library>, String> {
         .collect()
 }
 
+/// An Immich id (a UUID) that is safe to put in a request path.
+fn check_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("bad Immich id {id:?}"));
+    }
+    Ok(())
+}
+
 /// Requests to the server of `cfg`, stopped by `cancel`.
 pub struct Client<'a> {
     cfg: &'a Config,
@@ -191,9 +199,14 @@ impl<'a> Client<'a> {
         Client { cfg, cancel }
     }
 
-    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Option<Value>, String> {
+    fn limits(&self) -> http::Limits<'a> {
+        http::Limits { connect: Duration::from_secs(5), stall: Duration::from_secs(30), cancel: self.cancel }
+    }
+
+    /// Send a request; the response once its status says success.
+    fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<http::Response, String> {
         let url = http::Url::parse(&format!("{}{path}", self.cfg.url)).map_err(|e| e.to_string())?;
-        let limits = http::Limits { connect: Duration::from_secs(5), stall: Duration::from_secs(30), cancel: self.cancel };
+        let limits = self.limits();
         let mut headers = vec![("x-api-key", self.cfg.api_key.clone()), ("Accept", "application/json".to_string())];
         let sent = match body {
             Some(b) => {
@@ -203,15 +216,20 @@ impl<'a> Client<'a> {
             None if method == "POST" => http::post(&url, &headers, &[], &limits),
             None => http::get(&url, &headers, &limits),
         };
-        let mut r = sent.map_err(|e| match e {
+        let r = sent.map_err(|e| match e {
             http::HttpError::Connect(_) | http::HttpError::Stalled => format!("Immich unreachable at {}: {e}", self.cfg.url),
             e => format!("Immich: {e}"),
         })?;
         match r.status {
-            401 | 403 => return Err(format!("Immich refused the API key (status {})", r.status)),
-            200..=299 => {}
-            s => return Err(format!("Immich answered {s} for {path}")),
+            401 | 403 => Err(format!("Immich refused the API key (status {})", r.status)),
+            200..=299 => Ok(r),
+            s => Err(format!("Immich answered {s} for {path}")),
         }
+    }
+
+    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Option<Value>, String> {
+        let mut r = self.send(method, path, body)?;
+        let limits = self.limits();
         let mut out = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -250,11 +268,48 @@ impl<'a> Client<'a> {
         parse_libraries(&self.json("GET", "/api/libraries", None)?)
     }
 
+    /// Asset `asset`'s original file name (its last path component only: never a folder to write into).
+    pub fn asset_file_name(&self, asset: &str) -> Result<String, String> {
+        check_id(asset)?;
+        let v = self.json("GET", &format!("/api/assets/{asset}"), None)?;
+        let name = v.get("originalFileName").and_then(Value::as_str).unwrap_or_default();
+        let name = Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.is_empty() || name.starts_with('.') {
+            return Err(format!("Immich gave asset {asset} no usable file name"));
+        }
+        Ok(name.to_string())
+    }
+
+    /// Download asset `asset`'s original into file `to` (at most `max` bytes; a failed download leaves no file).
+    pub fn download_original(&self, asset: &str, to: &Path, max: u64) -> Result<(), String> {
+        check_id(asset)?;
+        let path = format!("/api/assets/{asset}/original");
+        let mut r = self.send("GET", &path, None)?;
+        let limits = self.limits();
+        let fail = |e: String| {
+            let _ = std::fs::remove_file(to);
+            e
+        };
+        let mut f = std::fs::File::create(to).map_err(|e| format!("{}: {e}", to.display()))?;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = r.read(&mut buf, &limits).map_err(|e| fail(format!("Immich: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+            if total > max {
+                return Err(fail(format!("asset {asset}'s original is larger than {} MB", max / (1024 * 1024))));
+            }
+            std::io::Write::write_all(&mut f, buf.get(..n).unwrap_or_default()).map_err(|e| fail(format!("{}: {e}", to.display())))?;
+        }
+        Ok(())
+    }
+
     /// Ask Immich to rescan library `id` (it queues the scan and answers at once).
     pub fn scan(&self, library_id: &str) -> Result<(), String> {
-        if library_id.is_empty() || !library_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(format!("bad library id {library_id:?}"));
-        }
+        check_id(library_id)?;
         self.call("POST", &format!("/api/libraries/{library_id}/scan"), None).map(|_| ())
     }
 }

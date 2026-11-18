@@ -96,3 +96,84 @@ fn three_failures_make_client_unusable() {
     }
     assert!(!c.usable());
 }
+
+// ---- the Immich builder (Task 3) ----
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("lc-previewremote-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn png_bytes(seed: u8) -> Vec<u8> {
+    let img = lightcraft_raster::Rgba8::from_fn(48, 32, |x, y| [(x * 5) as u8, (y * 7) as u8, seed, 255]);
+    crate::export::encode_image(&img, &crate::export::ExportOptions { format: crate::export::ExportFormat::Png, ..Default::default() }).unwrap()
+}
+
+/// A fake Immich serving asset `a`: its description and its original (binary), 404 for anything else.
+fn fake_immich_asset(original: Vec<u8>) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { continue };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = r.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let path = first.split_whitespace().nth(1).unwrap_or_default().to_string();
+            let (status, body): (u16, Vec<u8>) = match path.as_str() {
+                "/api/assets/a" => (200, br#"{"id":"a","originalFileName":"IMG_1.png","originalPath":"/mnt/media/x/IMG_1.png"}"#.to_vec()),
+                "/api/assets/a/original" => (200, original.clone()),
+                _ => (404, b"{}".to_vec()),
+            };
+            let mut w = s;
+            let _ = write!(w, "HTTP/1.1 {status} X\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = w.write_all(&body);
+        }
+    });
+    url
+}
+
+fn immich_cfg(url: &str) -> crate::immich::Config {
+    crate::immich::Config::from_json(&serde_json::json!({"url": url, "paths": {}}).to_string(), Some("test-key".into()), None).unwrap()
+}
+
+#[test]
+fn immich_builder_matches_local_build() {
+    let original = png_bytes(5);
+    let tmp = temp_dir("tmp");
+    let builder = immich_builder(immich_cfg(&fake_immich_asset(original.clone())), tmp.clone());
+    let b = builder("a").unwrap();
+    // the same file imported here
+    let here = temp_dir("here");
+    let file = here.join("IMG_1.png");
+    std::fs::write(&file, &original).unwrap();
+    let mut s = crate::Session::new().with_fs();
+    let local = (s.media.file_probe.clone().unwrap())(&file.to_string_lossy()).unwrap();
+    assert_eq!(b.probe.content_hash, local.content_hash);
+    assert!(b.probe.content_hash.is_some());
+    assert_eq!((b.probe.width, b.probe.height, b.probe.format.as_str()), (local.width, local.height, local.format.as_str()));
+    s.execute("library.import", &serde_json::json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let id = s.active().unwrap();
+    let p = (**s.catalog.photo(id).unwrap()).clone();
+    assert_eq!(b.smart, crate::cmd::previews::smart_bytes(&mut s, &p).unwrap());
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&here);
+}
+
+#[test]
+fn builder_cleans_temp_dir() {
+    let tmp = temp_dir("clean");
+    let builder = immich_builder(immich_cfg(&fake_immich_asset(png_bytes(6))), tmp.clone());
+    builder("a").unwrap();
+    assert!(builder("missing").is_err());
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "nothing left in {}", tmp.display());
+    let _ = std::fs::remove_dir_all(&tmp);
+}

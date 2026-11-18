@@ -46,6 +46,36 @@ edits them in place, the way it works on a Local folder.
 
 4. Restart LightCraft. Without the file the section stays hidden.
 
+## Smart previews from another computer
+
+Opening an Immich album or folder used to read every original over the network just to show it. With a
+**worker** on a computer next to the NAS (a desktop on the home network), LightCraft asks the worker instead:
+it downloads each original from Immich, builds its smart preview and reads its details, and sends those back.
+The laptop shows and edits the photo from the smart preview and reads the original only when the photo is
+opened at full size (loupe, 1:1, export). When the worker can't be reached, the laptop builds the smart
+previews itself from the mount, slower.
+
+On the worker computer (Docker, any Linux or WSL2):
+
+```sh
+git clone <your fork> lightcraft && cd lightcraft      # the same revision as the laptop's LightCraft
+cp docker/worker/.env.example docker/worker/.env       # fill in LISTEN_IP, IMMICH_URL, IMMICH_API_KEY, token
+docker compose -f docker/worker/compose.yml up -d --build
+```
+
+It restarts by itself (`restart: unless-stopped`) and keeps no photos: originals go to a memory-backed folder
+and are deleted once their preview is built. Moving it to another computer is the same three commands.
+
+On the laptop, add to `immich.json` and save the same token in a file only you can read:
+
+```json
+"worker": { "addr": "100.100.5.5:7991", "token_file": "~/.config/lightcraft/worker-token" }
+```
+
+**The protocol is not encrypted** (as AI Denoise's): publish the worker on a VPN (Tailscale) or LAN address
+only. Both sides must be built from the same revision; a worker that builds smart previews differently is
+refused at its greeting and the laptop builds them itself.
+
 ## Importing into Immich
 
 In the import dialog choose **Copy**, the mapped folder of the external library new shoots belong

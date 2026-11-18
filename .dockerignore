@@ -1,0 +1,7 @@
+target
+target-*
+.superpowers
+.git
+plan
+corpus
+docker/worker/.env

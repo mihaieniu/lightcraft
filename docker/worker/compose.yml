@@ -1,0 +1,20 @@
+# LightCraft worker (fork addition, CRAFT-9). On the computer that does the work:
+#   cp docker/worker/.env.example docker/worker/.env   # then fill it in
+#   docker compose -f docker/worker/compose.yml up -d --build
+# Laptop side: "worker" in ~/.config/lightcraft/immich.json (docs/immich.md).
+name: lightcraft
+services:
+  lightcraft-worker:
+    container_name: lightcraft-worker
+    build:
+      context: ../..
+      dockerfile: docker/worker/Dockerfile
+    image: lightcraft-worker:local
+    env_file: .env
+    restart: unless-stopped
+    # published on one address only (a VPN or LAN one): the protocol is not encrypted
+    ports:
+      - "${LISTEN_IP:?set LISTEN_IP in .env}:7991:7991"
+    mem_limit: 12g
+    tmpfs:
+      - /dev/shm/lightcraft:size=4g,uid=10001

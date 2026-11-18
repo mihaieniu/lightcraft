@@ -8,6 +8,7 @@
 //! lightcraft-cli merge hdr|panorama|hdr-panorama|hdr-batch [OPTIONS] FILES…
 //! lightcraft-cli synth-merge hdr|panorama -o DIR
 //! lightcraft-cli denoise-serve [--model ID] [--models DIR] [--listen ADDR] [--token-env VAR] [--run-on auto|gpu|cpu]
+//! lightcraft-cli preview-serve --listen ADDR [--max-connections N] [--tmp DIR]
 //! lightcraft-cli commands [--json]
 //! lightcraft-cli controls [--json]
 //! lightcraft-cli calibrate [--max N] [--out DIR] FOLDERS/FILES…
@@ -20,7 +21,7 @@ mod alloc_release;
 mod bench_cull;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lightcraft_engine::Session;
@@ -92,6 +93,10 @@ USAGE:
         --preview OUT.png   only render a ≤ 1024 px preview (nothing written next to the files)
   lightcraft-cli synth-merge hdr|panorama -o DIR
       Write synthetic merge inputs (procedural scene; bracketed DNGs or overlapping PNG views).
+  lightcraft-cli preview-serve --listen ADDR [--max-connections N] [--tmp DIR]
+      Build smart previews of Immich photos for LightCraft on other computers (fork addition; see docs/immich.md).
+      Reads IMMICH_URL, IMMICH_API_KEY and the shared LIGHTCRAFT_PREVIEW_TOKEN. Originals are downloaded into
+      --tmp (default /dev/shm/lightcraft) and deleted. Plain TCP: listen on a VPN/LAN address only.
   lightcraft-cli denoise-serve [OPTIONS]
       Run AI Denoise tiles for LightCraft on other computers (LIGHTCRAFT_DENOISE_URL=<this host>:7990 and
       LIGHTCRAFT_DENOISE_TOKEN there; see docs/denoise.md). Serves the installed model selected in Settings,
@@ -183,6 +188,7 @@ fn main() -> ExitCode {
         Some("synth-merge") => synth_merge(&args[1..]),
         Some("controls") => controls(&args[1..]),
         Some("denoise-serve") => denoise_serve(&args[1..]),
+        Some("preview-serve") => preview_serve(&args[1..]),
         Some("calibrate") => calibrate(&args[1..]),
         Some("bench-cull") => bench_cull::run(&args[1..]),
         Some("--version" | "-V" | "version") => {
@@ -1061,6 +1067,41 @@ fn controls(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// `preview-serve`: smart previews of Immich photos built for another computer (`lightcraft_engine::preview_remote`).
+fn preview_serve(args: &[String]) -> Result<(), String> {
+    use lightcraft_engine::preview_remote::{immich_builder, serve};
+    let mut listen: Option<String> = None;
+    let mut max_connections = 8usize;
+    let mut tmp = PathBuf::from("/dev/shm/lightcraft");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" => listen = Some(take_value(args, &mut i, "--listen")?.to_string()),
+            "--tmp" => tmp = PathBuf::from(take_value(args, &mut i, "--tmp")?),
+            "--max-connections" => {
+                max_connections = take_value(args, &mut i, "--max-connections")?.parse().map_err(|_| "--max-connections expects a number")?
+            }
+            "--help" | "-h" => {
+                println!("lightcraft-cli preview-serve --listen ADDR [--max-connections N] [--tmp DIR]");
+                return Ok(());
+            }
+            other => return Err(format!("preview-serve: unknown option `{other}`")),
+        }
+        i += 1;
+    }
+    let listen = listen.ok_or("preview-serve: --listen ADDR is required (this computer's VPN or LAN address and a port)")?;
+    let var = |k: &str| std::env::var(k).map_err(|_| format!("preview-serve: set ${k}"));
+    let token = var("LIGHTCRAFT_PREVIEW_TOKEN")?;
+    let url = var("IMMICH_URL")?;
+    let cfg =
+        lightcraft_engine::immich::Config::from_json(&serde_json::json!({"url": url, "paths": {}}).to_string(), Some(var("IMMICH_API_KEY")?), None)?;
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("preview-serve: {}: {e}", tmp.display()))?;
+    let listener = std::net::TcpListener::bind(&listen).map_err(|e| format!("preview-serve: {listen}: {e}"))?;
+    eprintln!("lightcraft-cli preview-serve: Immich {url} on {listen}, originals in {}", tmp.display());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    serve(listener, token, immich_builder(cfg, tmp), max_connections, stop).map_err(|e| format!("preview-serve: {e}"))
 }
 
 /// `denoise-serve`: the remote half of AI Denoise (`lightcraft_denoise::remote`).

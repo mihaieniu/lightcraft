@@ -28,6 +28,9 @@ use serde_json::{Value, json};
 
 use crate::media::ProbeInfo;
 
+mod build;
+pub use build::immich_builder;
+
 pub const PROTOCOL: u64 = 1;
 pub const DEFAULT_PORT: u16 = 7991;
 /// Longest message line (a probe carries the file's XMP packet).
