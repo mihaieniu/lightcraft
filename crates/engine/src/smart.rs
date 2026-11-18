@@ -92,7 +92,7 @@ const ENC_FIELD: &str = "enc";
 /// raises to [`JPEG_QUALITY`]); version 3 is the first to store the decoder facts in the tail. A
 /// stale proxy whose original is offline is kept as it is (see [`is_stale`]).
 /// Crate-visible so the look-marker test pins the marker format to it instead of to a literal.
-pub(crate) const ENCODE_VERSION: u64 = 3;
+pub const ENCODE_VERSION: u64 = 3;
 
 /// The decoder facts a render interprets its settings against, stored with the proxy's pixels so
 /// an offline original edits like it did online (the catalog's header facts cannot carry them).

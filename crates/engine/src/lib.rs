@@ -70,6 +70,8 @@ pub mod prep;
 pub mod preset_import;
 pub mod preset_luminar;
 pub mod presets;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod preview_remote;
 pub mod print;
 pub mod print_color;
 pub mod print_pdf;
