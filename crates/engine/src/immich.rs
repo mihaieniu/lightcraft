@@ -56,6 +56,70 @@ pub struct Album {
     pub id: String,
     pub name: String,
     pub count: u64,
+    /// When its photos start (ISO 8601, Immich's `startDate`); `None` for an empty album.
+    pub start: Option<String>,
+    /// The asset shown as its cover ([`Client::album_cover`]); `None` until looked up or when it has none.
+    pub cover: Option<String>,
+}
+
+/// How the album list is ordered (always under year headings).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlbumSort {
+    /// Newest first.
+    #[default]
+    Date,
+    /// By [`display_name`], ignoring case.
+    Name,
+}
+
+/// An album's name as shown: without the `L_` that marks the albums brought over from Lightroom (one, and only when
+/// something is left).
+pub fn display_name(name: &str) -> &str {
+    match name.strip_prefix("L_") {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => name,
+    }
+}
+
+/// The year an album starts in, when its date has one.
+fn year_of(a: &Album) -> Option<&str> {
+    let y = a.start.as_deref()?.get(..4)?;
+    y.bytes().all(|b| b.is_ascii_digit()).then_some(y)
+}
+
+/// `albums` under year headings (newest year first, "Undated" last), ordered within a year by `sort`: indices into
+/// `albums`.
+pub fn year_groups(albums: &[(Album, Group)], sort: AlbumSort) -> Vec<(String, Vec<usize>)> {
+    let mut ix: Vec<usize> = (0..albums.len()).collect();
+    let key = |i: &usize| albums.get(*i).map(|(a, _)| a);
+    ix.sort_by(|x, y| {
+        let (Some(a), Some(b)) = (key(x), key(y)) else { return std::cmp::Ordering::Equal };
+        // newest year first, undated last
+        let by_year = match (year_of(a), year_of(b)) {
+            (Some(p), Some(q)) => q.cmp(p),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_year.then_with(|| match sort {
+            // (undated albums have no date to order by: by name)
+            AlbumSort::Date if year_of(a).is_some() && year_of(b).is_some() => {
+                b.start.cmp(&a.start).then_with(|| display_name(&a.name).to_lowercase().cmp(&display_name(&b.name).to_lowercase()))
+            }
+            AlbumSort::Date => display_name(&a.name).to_lowercase().cmp(&display_name(&b.name).to_lowercase()),
+            AlbumSort::Name => display_name(&a.name).to_lowercase().cmp(&display_name(&b.name).to_lowercase()),
+        })
+    });
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    for i in ix {
+        let year = key(&i).and_then(year_of).map_or_else(|| "Undated".to_string(), str::to_string);
+        match out.last_mut() {
+            Some((y, v)) if *y == year => v.push(i),
+            _ => out.push((year, vec![i])),
+        }
+    }
+    out
 }
 
 /// An Immich external library and the folders it scans (as Immich sees them).
@@ -215,7 +279,13 @@ pub(crate) fn parse_albums(v: &Value) -> Result<Vec<Album>, String> {
     let list = v.as_array().ok_or("Immich sent no album list")?;
     list.iter()
         .map(|a| {
-            Ok(Album { id: str_field(a, "id")?, name: str_field(a, "albumName")?, count: a.get("assetCount").and_then(Value::as_u64).unwrap_or(0) })
+            Ok(Album {
+                id: str_field(a, "id")?,
+                name: str_field(a, "albumName")?,
+                count: a.get("assetCount").and_then(Value::as_u64).unwrap_or(0),
+                start: a.get("startDate").and_then(Value::as_str).map(str::to_string),
+                cover: None,
+            })
         })
         .collect()
 }

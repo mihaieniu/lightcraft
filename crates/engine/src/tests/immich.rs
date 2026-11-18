@@ -779,3 +779,69 @@ fn the_servers_probe_keeps_the_local_files_date() {
     let local = crate::files::modified_iso(&meta);
     assert_eq!(probe.file_modified, local);
 }
+
+// ---- album names, dates and year groups (CRAFT-11) ----
+
+fn album(id: &str, name: &str, start: Option<&str>) -> (crate::immich::Album, crate::immich::Group) {
+    (
+        crate::immich::Album { id: id.into(), name: name.into(), count: 1, start: start.map(String::from), cover: None },
+        crate::immich::Group::Lightroom,
+    )
+}
+
+fn names(albums: &[(crate::immich::Album, crate::immich::Group)], groups: &[(String, Vec<usize>)]) -> Vec<(String, Vec<String>)> {
+    groups.iter().map(|(y, ix)| (y.clone(), ix.iter().map(|i| crate::immich::display_name(&albums[*i].0.name).to_string()).collect())).collect()
+}
+
+#[test]
+fn display_name_and_years_edge_cases() {
+    use crate::immich::{AlbumSort, display_name, year_groups};
+    assert_eq!(display_name("L_Cununie 25.8.25"), "Cununie 25.8.25");
+    assert_eq!(display_name("L_"), "L_", "nothing left: the name as it is");
+    assert_eq!(display_name("Lake"), "Lake");
+    assert_eq!(display_name("L_L_x"), "L_x", "one prefix only");
+    assert!(year_groups(&[], AlbumSort::Date).is_empty());
+    let a = vec![album("1", "L_", None), album("2", "x", Some("not a date"))];
+    assert_eq!(names(&a, &year_groups(&a, AlbumSort::Date)), vec![("Undated".to_string(), vec!["L_".to_string(), "x".to_string()])]);
+}
+
+#[test]
+fn albums_sort_by_date_within_years() {
+    use crate::immich::{AlbumSort, year_groups};
+    let a = vec![
+        album("1", "L_Old", Some("2024-05-01T00:00:00.000Z")),
+        album("2", "L_Beta", Some("2026-01-02T00:00:00.000Z")),
+        album("3", "L_Alpha", Some("2026-06-20T00:00:00.000Z")),
+        album("4", "Nodate", None),
+    ];
+    assert_eq!(
+        names(&a, &year_groups(&a, AlbumSort::Date)),
+        vec![
+            ("2026".to_string(), vec!["Alpha".to_string(), "Beta".to_string()]),
+            ("2024".to_string(), vec!["Old".to_string()]),
+            ("Undated".to_string(), vec!["Nodate".to_string()]),
+        ]
+    );
+}
+
+#[test]
+fn albums_sort_by_name_within_years() {
+    use crate::immich::{AlbumSort, year_groups};
+    let a = vec![
+        album("1", "L_beta", Some("2026-06-20T00:00:00Z")),
+        album("2", "Alpha", Some("2026-01-02T00:00:00Z")),
+        album("3", "L_Gamma", Some("2026-03-01T00:00:00Z")),
+    ];
+    assert_eq!(
+        names(&a, &year_groups(&a, AlbumSort::Name)),
+        vec![("2026".to_string(), vec!["Alpha".to_string(), "beta".to_string(), "Gamma".to_string()])]
+    );
+}
+
+#[test]
+fn parse_albums_reads_start_date() {
+    let v = json!([{"id": "a", "albumName": "L_X", "assetCount": 3, "startDate": "2026-06-20T00:00:00.000Z"}, {"id": "b", "albumName": "Y", "assetCount": 0}]);
+    let a = parse_albums(&v).unwrap();
+    assert_eq!(a[0].start.as_deref(), Some("2026-06-20T00:00:00.000Z"));
+    assert_eq!(a[1].start, None);
+}
