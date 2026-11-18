@@ -250,3 +250,53 @@ fn immich_section_is_first_with_groups_and_pins() {
     let st = h.app.session.execute("immich.cacheStats", &json!({})).unwrap();
     assert_eq!(st["pins"], json!([{"folder": "/mnt/media/Lightroom"}]), "{st}");
 }
+
+/// Albums show without `L_`, under year headings, in the order chosen, each with its cover (CRAFT-11).
+#[test]
+fn albums_show_covers_names_and_years() {
+    let dir = temp("covers");
+    let covers = dir.join("covers");
+    std::fs::create_dir_all(&covers).unwrap();
+    // the cover of "L_Trip", already cached (a real WebP)
+    let img = lightcraft_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 30) as u8, (y * 30) as u8, 200, 255]);
+    std::fs::write(
+        covers.join("c1.webp"),
+        lightcraft_codecs::encode_webp_lossless(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap(),
+    )
+    .unwrap();
+    let url = fake_immich(vec![
+        (
+            "GET /api/albums",
+            json!([
+                {"id": "a1", "albumName": "L_Trip", "assetCount": 1, "startDate": "2026-06-20T00:00:00.000Z"},
+                {"id": "a2", "albumName": "L_Apples", "assetCount": 1, "startDate": "2026-01-02T00:00:00.000Z"},
+                {"id": "a3", "albumName": "L_Zoo", "assetCount": 1, "startDate": "2024-05-01T00:00:00.000Z"}
+            ])
+            .to_string(),
+        ),
+        ("POST /api/search/metadata", json!({"assets": {"items": [{"originalPath": "/srv/a.png", "id": "c1"}], "nextPage": null}}).to_string()),
+    ]);
+    let text = json!({"url": url, "paths": {"/srv": dir.to_string_lossy()}}).to_string();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.set_immich(Some(lightcraft_engine::immich::Config::from_json(&text, Some("k".into()), None).unwrap()));
+    let mut app = LightcraftApp::new(session, crate::Services { png: None, ..Default::default() });
+    app.immich.covers_dir = Some(covers);
+    crate::panels::empty_library::open_on_empty_library(&mut app);
+    let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+    assert!(h.step_until(T, |h| h.painted_text().iter().any(|t| t == "Trip")), "{:?}", h.painted_text());
+    h.settle(T);
+    let text = h.painted_text();
+    assert!(!text.iter().any(|t| t.starts_with("L_")), "no L_ shown: {text:?}");
+    let top = |h: &Headless, id: &str| crate::control::widget_rect(&h.app, id).unwrap_or_else(|| panic!("{id}")).top();
+    // by date: 2026 (Trip, then Apples), then 2024 (Zoo)
+    assert!(top(&h, "text:immichYear:other:2026") < top(&h, "source:immich:a1"));
+    assert!(top(&h, "source:immich:a1") < top(&h, "source:immich:a2"));
+    assert!(top(&h, "source:immich:a2") < top(&h, "text:immichYear:other:2024"));
+    assert!(top(&h, "text:immichYear:other:2024") < top(&h, "source:immich:a3"));
+    assert!(h.step_until(T, |h| crate::control::widget_rect(&h.app, "cover:immich:a1").is_some()), "the cover is drawn");
+    // by name: within 2026, Apples before Trip
+    assert_eq!(h.request("engine.execute", json!({"command": "view.immichAlbumSort", "params": {"sort": "name"}}), T)["ok"], true);
+    assert_eq!(h.app.ui.immich_album_sort, lightcraft_engine::immich::AlbumSort::Name);
+    h.settle(T);
+    assert!(top(&h, "source:immich:a2") < top(&h, "source:immich:a1"));
+}

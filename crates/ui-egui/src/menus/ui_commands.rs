@@ -180,6 +180,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("dialog.newFolder", "New Folder…", Some("Cmd+Shift+N"), "File"),
     ("dialog.smartAlbum", "New Smart Album…", None, "File"),
     ("view.photoCounts", "Photo Counts", None, "View"),
+    ("view.immichAlbumSort", "Sort Immich Albums", None, "View"),
     ("view.sidebarSection", "Show Sidebar Section", None, ""),
     ("view.sidebarMoveSection", "Move Sidebar Section", None, ""),
     ("view.sidebarReset", "Reset Sidebar Sections", None, ""),

@@ -264,6 +264,17 @@ fn ui_commands_1(app: &mut LightcraftApp, ctx: &egui::Context, id: &str, p: &Val
             app.ui.second_window = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.second_window);
             Ok(json!({"show": app.ui.second_window}))
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        "view.immichAlbumSort" => {
+            // {sort: "date" | "name"}: how the Immich albums are ordered under their year headings
+            let sort = match p.get("sort").and_then(Value::as_str) {
+                Some("date") => lightcraft_engine::immich::AlbumSort::Date,
+                Some("name") => lightcraft_engine::immich::AlbumSort::Name,
+                _ => return Some(Err("give `sort`: date or name".into())),
+            };
+            app.ui.immich_album_sort = sort;
+            Ok(json!({"sort": sort}))
+        }
         "view.photoCounts" => {
             app.ui.show_counts = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.show_counts);
             Ok(json!({"show": app.ui.show_counts}))

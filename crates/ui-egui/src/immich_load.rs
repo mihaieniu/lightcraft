@@ -30,6 +30,11 @@ pub struct State {
     pub task: Option<Task>,
     /// When the unshown photos' smart previews were last expired.
     expired_at: Option<std::time::Instant>,
+    /// Album covers by asset id (`None`: being read, or none could be made).
+    pub covers: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    covers_rx: Option<Receiver<(String, Option<egui::ColorImage>)>>,
+    /// Where covers are cached (`None`: [`lightcraft_engine::immich::covers_dir`]).
+    pub covers_dir: Option<std::path::PathBuf>,
 }
 
 type Listing = (Result<Vec<(Album, Group)>, String>, Option<Folders>);
@@ -112,6 +117,55 @@ pub fn refresh_albums(app: &mut LightcraftApp) {
         Ok(_) => app.immich.albums_rx = Some(rx),
         Err(e) => app.immich.albums = Some(Err(e.to_string())),
     }
+}
+
+/// Read the albums' covers on a worker thread (from the cache, else from the server), as small pictures.
+fn load_covers(app: &mut LightcraftApp) {
+    let Some(cfg) = app.session.immich.clone() else { return };
+    let Some(dir) = app.immich.covers_dir.clone().or_else(lightcraft_engine::immich::covers_dir) else { return };
+    let wanted: Vec<String> = match &app.immich.albums {
+        Some(Ok(a)) => a.iter().filter_map(|(a, _)| a.cover.clone()).filter(|c| !app.immich.covers.contains_key(c)).collect(),
+        _ => return,
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    for w in &wanted {
+        app.immich.covers.insert(w.clone(), None);
+    }
+    let (tx, rx) = channel();
+    let spawned = std::thread::Builder::new().name("immich-covers".into()).spawn(move || {
+        let cancel = AtomicBool::new(false);
+        for asset in wanted {
+            let img = lightcraft_engine::immich::cached_cover(&cfg, &asset, &dir, &cancel)
+                .ok()
+                .and_then(|f| std::fs::read(f).ok())
+                .and_then(|b| lightcraft_engine::immich::cover_pixels(&b))
+                .map(|px| small(&px, 64));
+            if tx.send((asset, img)).is_err() {
+                return;
+            }
+        }
+    });
+    if spawned.is_ok() {
+        app.immich.covers_rx = Some(rx);
+    }
+}
+
+/// `img` shrunk to at most `edge` pixels on its long side (nearest pixel: a cover is tiny).
+fn small(img: &lightcraft_raster::Rgba8, edge: usize) -> egui::ColorImage {
+    let long = img.width.max(img.height).max(1);
+    let scale = (edge as f64 / long as f64).min(1.0);
+    let (w, h) = (((img.width as f64 * scale).round() as usize).max(1), ((img.height as f64 * scale).round() as usize).max(1));
+    let mut px = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let sx = (x * img.width / w).min(img.width.saturating_sub(1));
+            let sy = (y * img.height / h).min(img.height.saturating_sub(1));
+            px.extend_from_slice(&img.data.get(sy * img.width + sx).copied().unwrap_or([0, 0, 0, 255]));
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &px)
 }
 
 /// Show album `id`: the view switches at once and fills in as the worker reads the files.
@@ -228,6 +282,7 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 };
                 app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);
                 app.immich.albums_rx = None;
+                load_covers(app);
             }
             Err(TryRecvError::Disconnected) => app.immich.albums_rx = None,
             Err(TryRecvError::Empty) => ctx.request_repaint(),
@@ -248,6 +303,22 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     // smart previews the preview server couldn't make (it went away mid-fetch) are built here
     if app.session.immich_previews.as_ref().is_some_and(|(rp, _)| rp.has_queued()) {
         app.session.build_queued_immich_previews();
+    }
+    if let Some(rx) = &app.immich.covers_rx {
+        loop {
+            match rx.try_recv() {
+                Ok((asset, img)) => {
+                    let tex = img.map(|i| ctx.load_texture(format!("immich-cover-{asset}"), i, egui::TextureOptions::LINEAR));
+                    app.immich.covers.insert(asset, tex);
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.immich.covers_rx = None;
+                    break;
+                }
+            }
+        }
     }
     let Some(mut task) = app.immich.task.take() else { return };
     // the view moved on: nothing more to add
@@ -282,6 +353,10 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 // shown now: their smart previews' keep days start again
                 let shown = app.session.visible().to_vec();
                 lightcraft_engine::immich_retention::touch(&mut app.session, &shown);
+                // a pinned album keeps whatever it holds now (photos added since it was pinned too)
+                if task.pin.is_none() && app.immich.pins.iter().any(|p| matches!(p, Pin::Album { id, .. } if *id == task.id)) {
+                    task.pin = Some(Pin::Album { id: task.id.clone(), paths: Vec::new() });
+                }
                 if let Some(Pin::Album { id, .. }) = task.pin.take() {
                     lightcraft_engine::immich_retention::add_pin(&mut app.session, Pin::Album { id, paths: task.found.files.clone() });
                     app.immich.pins = lightcraft_engine::immich_retention::pins(&app.session);

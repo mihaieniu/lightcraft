@@ -110,11 +110,13 @@ pub(super) struct Row<'a> {
     sense: Sense,
     /// a colour label's dot, before the count
     mark: Option<egui::Color32>,
+    /// a picture drawn in place of the icon (an Immich album's cover)
+    image: Option<egui::TextureId>,
 }
 
 impl<'a> Row<'a> {
     pub(super) fn new(id: &'a str, icon: Icon, label: &'a str) -> Self {
-        Row { id, icon, label, spoken: None, count: None, selected: false, indent: 0.0, sense: Sense::click(), mark: None }
+        Row { id, icon, label, spoken: None, count: None, selected: false, indent: 0.0, sense: Sense::click(), mark: None, image: None }
     }
 
     pub(super) fn spoken(mut self, spoken: &'a str) -> Self {
@@ -142,6 +144,11 @@ impl<'a> Row<'a> {
         self
     }
 
+    pub(super) fn image(mut self, image: Option<egui::TextureId>) -> Self {
+        self.image = image;
+        self
+    }
+
     pub(super) fn mark(mut self, mark: Option<egui::Color32>) -> Self {
         self.mark = mark;
         self
@@ -155,7 +162,7 @@ impl<'a> Row<'a> {
 
 /// Draw a [`Row`].
 fn draw_row(app: &mut LightcraftApp, ui: &mut egui::Ui, row: Row) -> egui::Response {
-    let Row { id, icon, label, spoken, count, selected, indent, sense, mark } = row;
+    let Row { id, icon, label, spoken, count, selected, indent, sense, mark, image } = row;
     let label = if matches!(id, "all" | "recentlyAdded" | "picks" | "missing" | "recentlyDeleted") { crate::i18n::tr(label) } else { label };
     let t = Tokens::get(ui.ctx());
     let indent = drawn_indent(ui, indent);
@@ -182,12 +189,19 @@ fn draw_row(app: &mut LightcraftApp, ui: &mut egui::Ui, row: Row) -> egui::Respo
     } else if resp.hovered() {
         ui.painter().rect_filled(inner, 4.0, t.hover.gamma_multiply(0.6));
     }
-    paint(
-        ui.painter(),
-        Rect::from_min_size(pos2(r.left() + 18.0 + indent, r.center().y - 8.0), vec2(16.0, 16.0)),
-        icon,
-        if selected { t.text } else { t.icon },
-    );
+    match image {
+        Some(tex) => {
+            let at = Rect::from_min_size(pos2(r.left() + 16.0 + indent, r.center().y - 10.0), vec2(20.0, 20.0));
+            egui::Image::new((tex, at.size())).corner_radius(3.0).paint_at(ui, at);
+            register(ui, format!("cover:{id}"), at);
+        }
+        None => paint(
+            ui.painter(),
+            Rect::from_min_size(pos2(r.left() + 18.0 + indent, r.center().y - 8.0), vec2(16.0, 16.0)),
+            icon,
+            if selected { t.text } else { t.icon },
+        ),
+    }
     let font = t.font(13.5);
     let color = if selected { t.text } else { t.text_label };
     // a count of nothing is there, but fainter: the rows that hold photos stand out

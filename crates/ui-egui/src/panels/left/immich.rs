@@ -23,9 +23,23 @@ pub(super) fn section(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let status = if app.immich.refreshing() { "Loading…" } else { "↻" };
     ui.painter().text(pos2(header.right() - 18.0, header.center().y), Align2::RIGHT_CENTER, status, t.font(11.0), t.text_dim);
     register(ui, "button:immichRefresh", header);
-    if resp.on_hover_text("List the Immich folders and albums again").clicked() && !app.immich.refreshing() {
+    let resp = resp.on_hover_text("List the Immich folders and albums again");
+    if resp.clicked() && !app.immich.refreshing() {
         crate::immich_load::refresh_albums(app);
     }
+    crate::widgets::context_menu(&resp, |ui| {
+        use lightcraft_engine::immich::AlbumSort;
+        for (sort, label, id) in
+            [(AlbumSort::Date, "Sort Albums by Date", "button:immichSortDate"), (AlbumSort::Name, "Sort Albums by Name", "button:immichSortName")]
+        {
+            let r = ui.radio(app.ui.immich_album_sort == sort, label);
+            register(ui, id, r.rect);
+            if r.clicked() {
+                app.ui.immich_album_sort = sort;
+                ui.close();
+            }
+        }
+    });
     // the preview server is off or failing: smart previews are built here, slower
     if app.session.immich_previews.as_ref().is_some_and(|(rp, _)| rp.fallback_active()) {
         let r =
@@ -54,25 +68,41 @@ pub(super) fn section(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         for (_, root, name) in roots.iter().filter(|(g, _, _)| *g == group) {
             folder_rows(app, ui, root, name, 0.0, current.as_deref());
         }
-        for (a, _) in albums.iter().filter(|(_, g)| *g == group) {
-            let count = usize::try_from(a.count).ok();
-            let pinned = app.immich.pins.iter().any(|p| matches!(p, Pin::Album { id, .. } if *id == a.id));
-            let resp = Row::new(&format!("immich:{}", a.id), Icon::Album, &a.name)
-                .count(count)
-                .selected(current.as_deref() == Some(a.id.as_str()))
-                .mark(pinned.then_some(t.accent))
-                .show(app, ui);
-            pin_menu(app, &resp, Pin::Album { id: a.id.clone(), paths: Vec::new() }, &a.name, pinned);
-            if resp.clicked()
-                && let Err(e) = crate::immich_load::start(app, &a.id, &a.name)
-            {
-                app.toast_error(ui.ctx(), e);
+        let in_group: Vec<(lightcraft_engine::immich::Album, Group)> = albums.iter().filter(|(_, g)| *g == group).cloned().collect();
+        for (year, ix) in lightcraft_engine::immich::year_groups(&in_group, app.ui.immich_album_sort) {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+            ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, &year, t.font(10.5), t.text_dim);
+            register(ui, format!("text:immichYear:{key}:{year}"), r);
+            for i in ix {
+                let Some((a, _)) = in_group.get(i) else { continue };
+                album_row(app, ui, a, current.as_deref());
             }
         }
     }
     ui.add_space(SECTION_GAP);
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().hline(line.left() + 18.0..=(line.right() - 18.0).max(line.left() + 18.0), line.center().y, egui::Stroke::new(1.0, t.divider));
+}
+
+/// Album `a`: its cover, its name without `L_`, its count; a click shows it, its menu keeps it offline.
+fn album_row(app: &mut LightcraftApp, ui: &mut egui::Ui, a: &lightcraft_engine::immich::Album, current: Option<&str>) {
+    let t = Tokens::get(ui.ctx());
+    let name = lightcraft_engine::immich::display_name(&a.name).to_string();
+    let count = usize::try_from(a.count).ok();
+    let pinned = app.immich.pins.iter().any(|p| matches!(p, Pin::Album { id, .. } if *id == a.id));
+    let cover = a.cover.as_ref().and_then(|c| app.immich.covers.get(c)).and_then(|t| t.as_ref()).map(egui::TextureHandle::id);
+    let resp = Row::new(&format!("immich:{}", a.id), Icon::Album, &name)
+        .count(count)
+        .selected(current == Some(a.id.as_str()))
+        .mark(pinned.then_some(t.accent))
+        .image(cover)
+        .show(app, ui);
+    pin_menu(app, &resp, Pin::Album { id: a.id.clone(), paths: Vec::new() }, &name, pinned);
+    if resp.clicked()
+        && let Err(e) = crate::immich_load::start(app, &a.id, &name)
+    {
+        app.toast_error(ui.ctx(), e);
+    }
 }
 
 /// Folder `path` (as Immich sees it) shown as `name`, and, when open, the folders inside it.

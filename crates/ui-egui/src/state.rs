@@ -118,6 +118,9 @@ pub struct UiState {
     pub grid_info: String,
     /// Photo counts next to sources and albums in the left panel.
     pub show_counts: bool,
+    /// How the Immich albums are ordered in the sidebar (under year headings).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub immich_album_sort: lightcraft_engine::immich::AlbumSort,
     /// Face / pet boxes (read from XMP) over the photo in the loupe.
     pub face_boxes: bool,
     /// The left sidebar's sections: their order, which are hidden and which are folded shut.
@@ -438,6 +441,8 @@ impl Default for UiState {
             show_filenames: true,
             grid_info: "filename".into(),
             show_counts: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            immich_album_sort: Default::default(),
             face_boxes: true,
             sidebar: Default::default(),
             collapsed_sidebar: Vec::new(),
